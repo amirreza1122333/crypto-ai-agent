@@ -1,0 +1,8 @@
+{
+  "820839822": {
+    "alerts_enabled": true,
+    "min_score": 0.55,
+    "scan_limit": 5,
+    "favorite_bucket": "any"
+  }
+}
