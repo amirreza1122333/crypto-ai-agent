@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile app/*.py)",
+      "Bash(grep -r \"import .*missing\" /d/crypto_ai_agent/app/*.py)",
+      "Bash(grep -rn \"from app\\\\.\" /d/crypto_ai_agent/app/*.py)",
+      "Bash(grep -rn \"\\\\.get\\(\" app/*.py)",
+      "Bash(grep -n \"verify=False\" app/*.py)",
+      "Bash(python -m app.predictor)",
+      "Bash(curl -s http://127.0.0.1:8000/)",
+      "Bash(python -c \"from app.api import app; print\\('API import OK'\\)\")",
+      "Bash(start cmd:*)",
+      "Bash(uvicorn app.api:app --port 8000)",
+      "Bash(echo \"API started with PID $!\")",
+      "Bash(python -m uvicorn app.api:app --port 8000)",
+      "Bash(echo \"PID: $!\")",
+      "Bash(python -m app.telegram_bot)",
+      "Bash(echo \"Bot PID: $!\")",
+      "Bash(echo \"---exit $?\")",
+      "Bash(jobs -l)",
+      "Bash(netstat -ano)",
+      "Bash(taskkill //F //PID 19648)",
+      "Bash(taskkill //F //IM python.exe)",
+      "Bash(python -c ':*)",
+      "Bash(pip install:*)",
+      "Bash(taskkill //F //PID 2708)"
+    ]
+  }
+}

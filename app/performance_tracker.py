@@ -3,9 +3,10 @@ import sqlite3
 import requests
 
 from pathlib import Path
+from app.config import API_BASE_URL
 
 DB_PATH = Path(__file__).resolve().parent.parent / "user_data.db"
-API_URL = "http://127.0.0.1:8000"
+API_URL = API_BASE_URL
 
 
 EVALUATION_DELAY = 3600  # 1 ساعت
@@ -35,7 +36,8 @@ def fetch_current_price(symbol):
         for c in data:
             if str(c.get("symbol", "")).upper() == symbol.upper():
                 return float(c.get("current_price", 0) or 0)
-    except:
+    except (requests.RequestException, ValueError, KeyError) as e:
+        print(f"[WARN] fetch_current_price failed for {symbol}: {e}")
         return None
 
     return None

@@ -123,7 +123,7 @@ def train_model():
     print(importances.head(15).to_string(index=False))
 
     save_model(model, used_features)
-    print("\n✅ Model saved successfully.")
+    print("\n[OK] Model saved successfully.")
 
 
 if __name__ == "__main__":

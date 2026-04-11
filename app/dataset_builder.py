@@ -139,7 +139,7 @@ def build_training_dataset(
 ) -> pd.DataFrame:
     raw = load_all_data()
     if raw.empty:
-        print("❌ No historical data found.")
+        print("[ERROR] No historical data found.")
         return pd.DataFrame()
 
     labeled = build_future_labels(
@@ -148,7 +148,7 @@ def build_training_dataset(
         up_threshold=up_threshold,
     )
     if labeled.empty:
-        print("❌ Not enough history yet to create future labels.")
+        print("[ERROR] Not enough history yet to create future labels.")
         return pd.DataFrame()
 
     dataset = add_ml_features(labeled)
@@ -156,7 +156,7 @@ def build_training_dataset(
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     dataset.to_csv(OUTPUT_CSV, index=False)
 
-    print(f"✅ ML dataset saved: {OUTPUT_CSV}")
+    print(f"[OK] ML dataset saved: {OUTPUT_CSV}")
     print(f"Rows: {len(dataset)}")
     print(f"Positive targets: {dataset['target_up_6h_3pct'].sum()}")
     print(f"Negative targets: {(dataset['target_up_6h_3pct'] == 0).sum()}")

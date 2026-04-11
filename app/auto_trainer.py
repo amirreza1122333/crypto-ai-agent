@@ -6,7 +6,7 @@ from app.predictor import train_model
 def loop():
     while True:
         try:
-            print("🔄 Auto retraining...")
+            print("[INFO] Auto retraining...")
 
             df = build_training_dataset()
             if not df.empty:

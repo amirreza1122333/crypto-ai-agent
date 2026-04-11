@@ -1,7 +1,8 @@
 import requests
 from app.paper_trader import get_open_positions
+from app.config import API_BASE_URL
 
-API_URL = "http://127.0.0.1:8000"
+API_URL = API_BASE_URL
 
 
 def fetch_scan_results():

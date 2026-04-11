@@ -1,12 +1,11 @@
 import time
 import requests
-import pandas as pd
 import urllib3
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import pandas as pd
 
 from app.config import (
     COINGECKO_BASE_URL,
+    COINGECKO_API_KEY,
     VS_CURRENCY,
     PER_PAGE,
     PAGES,
@@ -16,6 +15,10 @@ from app.config import (
     BACKOFF_FACTOR,
 )
 
+# SSL verification is disabled due to system-level certificate interception
+# (antivirus/VPN SSL inspection). Safe for local development only.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 DEFAULT_HEADERS = {
     "Accept": "application/json",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
@@ -23,7 +26,7 @@ DEFAULT_HEADERS = {
     "Connection": "keep-alive",
 }
 
-COINCAP_BASE_URL = "https://api.coincap.io/v2/assets"
+COINPAPRIKA_BASE_URL = "https://api.coinpaprika.com/v1/tickers"
 
 
 def _fetch_page_coingecko(session: requests.Session, page: int) -> list:
@@ -35,15 +38,12 @@ def _fetch_page_coingecko(session: requests.Session, page: int) -> list:
         "page": page,
         "price_change_percentage": "24h,7d",
     }
+    if COINGECKO_API_KEY:
+        params["x_cg_demo_api_key"] = COINGECKO_API_KEY
 
     for attempt in range(MAX_RETRIES + 1):
         try:
-            response = session.get(
-                url,
-                params=params,
-                timeout=REQUEST_TIMEOUT,
-                verify=False,  # فقط برای تست لوکال
-            )
+            response = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
 
             if response.status_code == 200:
                 print(f"[OK] CoinGecko page {page} fetched")
@@ -56,7 +56,7 @@ def _fetch_page_coingecko(session: requests.Session, page: int) -> list:
                 continue
 
             print(f"[ERROR] CoinGecko page {page} -> {response.status_code}")
-            print(response.text[:500])
+            print(response.text[:300].encode("ascii", errors="replace").decode())
             return []
 
         except requests.RequestException as exc:
@@ -70,11 +70,11 @@ def _fetch_page_coingecko(session: requests.Session, page: int) -> list:
 
 
 def _fetch_from_coingecko(session: requests.Session) -> pd.DataFrame:
-    print("\n🚀 TRYING COINGECKO...\n")
+    print("\n[INFO] TRYING COINGECKO...\n")
     all_data = []
 
     for page in range(1, PAGES + 1):
-        print(f"📄 Fetching CoinGecko page {page}...")
+        print(f"[INFO] Fetching CoinGecko page {page}...")
         page_data = _fetch_page_coingecko(session, page)
 
         if not page_data:
@@ -91,79 +91,69 @@ def _fetch_from_coingecko(session: requests.Session) -> pd.DataFrame:
     df = pd.DataFrame(all_data)
 
     expected_cols = [
-        "id",
-        "symbol",
-        "name",
-        "current_price",
-        "market_cap",
-        "market_cap_rank",
-        "total_volume",
-        "price_change_percentage_24h",
-        "price_change_percentage_7d_in_currency",
-        "circulating_supply",
+        "id", "symbol", "name", "current_price", "market_cap",
+        "market_cap_rank", "total_volume", "price_change_percentage_24h",
+        "price_change_percentage_7d_in_currency", "circulating_supply",
     ]
-
     existing_cols = [col for col in expected_cols if col in df.columns]
     return df[existing_cols]
 
 
-def _fetch_from_coincap(session: requests.Session) -> pd.DataFrame:
-    print("\n🟡 FALLBACK TO COINCAP...\n")
-
+def _fetch_from_coinpaprika(session: requests.Session) -> pd.DataFrame:
+    print("\n[INFO] FALLBACK TO COINPAPRIKA...\n")
     try:
         response = session.get(
-            COINCAP_BASE_URL,
+            COINPAPRIKA_BASE_URL,
+            params={"limit": PER_PAGE * PAGES},
             timeout=REQUEST_TIMEOUT,
-            verify=False,
         )
         response.raise_for_status()
-        payload = response.json()
-        data = payload.get("data", [])
+        data = response.json()
 
         if not data:
             return pd.DataFrame()
 
         rows = []
-        for i, item in enumerate(data, start=1):
+        for item in data:
+            usd = item.get("quotes", {}).get("USD", {})
             rows.append({
                 "id": item.get("id"),
                 "symbol": item.get("symbol"),
                 "name": item.get("name"),
-                "current_price": float(item.get("priceUsd")) if item.get("priceUsd") else None,
-                "market_cap": float(item.get("marketCapUsd")) if item.get("marketCapUsd") else None,
-                "market_cap_rank": i,
-                "total_volume": float(item.get("volumeUsd24Hr")) if item.get("volumeUsd24Hr") else None,
-                "price_change_percentage_24h": float(item.get("changePercent24Hr")) if item.get("changePercent24Hr") else None,
-                "price_change_percentage_7d_in_currency": None,
-                "circulating_supply": float(item.get("supply")) if item.get("supply") else None,
+                "current_price": usd.get("price"),
+                "market_cap": usd.get("market_cap"),
+                "market_cap_rank": item.get("rank"),
+                "total_volume": usd.get("volume_24h"),
+                "price_change_percentage_24h": usd.get("percent_change_24h"),
+                "price_change_percentage_7d_in_currency": usd.get("percent_change_7d"),
+                "circulating_supply": item.get("total_supply"),
             })
 
         df = pd.DataFrame(rows)
-        print(f"[OK] CoinCap fetched {len(df)} rows")
+        print(f"[OK] CoinPaprika fetched {len(df)} rows")
         return df
 
     except requests.RequestException as exc:
-        print(f"[FAILED] CoinCap error: {exc}")
+        print(f"[FAILED] CoinPaprika error: {exc}")
         return pd.DataFrame()
 
 
 def fetch_market_data() -> pd.DataFrame:
-    print("\n🚀 START FETCHING MARKET DATA...\n")
+    print("\n[INFO] START FETCHING MARKET DATA...\n")
 
     session = requests.Session()
     session.headers.update(DEFAULT_HEADERS)
+    session.verify = False
 
-    # اول CoinGecko
     df = _fetch_from_coingecko(session)
     if not df.empty:
-        print("✅ Using CoinGecko data\n")
+        print("[OK] Using CoinGecko data\n")
         return df
 
-    # fallback
-    df = _fetch_from_coincap(session)
+    df = _fetch_from_coinpaprika(session)
     if not df.empty:
-        print("✅ Using CoinCap data\n")
+        print("[OK] Using CoinPaprika data\n")
         return df
 
-    print("\n❌ NO DATA RECEIVED FROM ANY API\n")
+    print("\n[ERROR] NO DATA RECEIVED FROM ANY API\n")
     return pd.DataFrame()

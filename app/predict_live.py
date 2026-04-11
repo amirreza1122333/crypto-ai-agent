@@ -120,7 +120,7 @@ def predict_live_top(n: int = 10):
 
     df = get_cached_pipeline()
     if df is None or df.empty:
-        print("❌ No live data available.")
+        print("[ERROR] No live data available.")
         return
 
     df = enrich_level3(df)

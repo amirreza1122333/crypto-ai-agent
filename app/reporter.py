@@ -12,19 +12,18 @@ from app.signals import (
 )
 
 
-# 🔥 NEW: AI signal ترکیبی
 def compute_ai_signal(row):
     prob = row.get("pump_probability_6h", 0)
     score = row.get("final_score", 0)
 
     if prob >= 0.75 and score >= 0.6:
-        return "🔥 AI Strong"
+        return "AI Strong"
     if prob >= 0.65:
-        return "⚡ AI Watch"
-    return "—"
+        return "AI Watch"
+    return "-"
 
 
-# 🔥 NEW: رتبه‌بندی ترکیبی
+
 def compute_combined_score(row):
     score = row.get("final_score", 0)
     prob = row.get("pump_probability_6h", 0)

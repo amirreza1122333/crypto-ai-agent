@@ -21,7 +21,7 @@ def load_closed_alerts():
 def build_feedback_dataset():
     df = load_closed_alerts()
     if df.empty:
-        print("❌ No closed alerts yet.")
+        print("[INFO] No closed alerts yet.")
         return pd.DataFrame()
 
     # target واقعی

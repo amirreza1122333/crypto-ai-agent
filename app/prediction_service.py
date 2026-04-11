@@ -127,14 +127,23 @@ def build_live_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_prediction(df: pd.DataFrame) -> pd.DataFrame:
-    model = load_model()
-    features = load_feature_names()
+    try:
+        model = load_model()
+        features = load_feature_names()
+    except FileNotFoundError as e:
+        print(f"[WARN] Model not found, skipping predictions: {e}")
+        df = df.copy()
+        df["pump_probability_6h"] = 0.0
+        df["prediction_label"] = "No Model"
+        return df
+
     threshold = get_dynamic_threshold()
 
     out = build_live_features(df.copy())
 
     for c in features:
         if c not in out.columns:
+            print(f"[WARN] Missing feature '{c}', filling with 0.0")
             out[c] = 0.0
 
     X = out[features].fillna(0)

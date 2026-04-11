@@ -1,6 +1,5 @@
 import os
 import time
-import json
 import sqlite3
 import threading
 import requests
@@ -19,7 +18,7 @@ from app.user_store import ensure_user, update_user
 # Load ENV
 # -----------------------------
 env_path = Path(__file__).resolve().parent.parent / ".env"
-load_dotenv(env_path)
+load_dotenv(env_path, override=True)
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 API_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")

@@ -1,4 +1,6 @@
 from datetime import datetime, timedelta
+import math
+import json
 
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse, Response
@@ -26,6 +28,20 @@ app = FastAPI(
     description="Scan, score, classify, explain, and export crypto market candidates."
 )
 
+def sanitize_records(records):
+    """Replace NaN/Infinity with None for JSON serialization."""
+    clean = []
+    for row in records:
+        clean_row = {}
+        for k, v in row.items():
+            if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                clean_row[k] = None
+            else:
+                clean_row[k] = v
+        clean.append(clean_row)
+    return clean
+
+
 CACHE_TTL_SECONDS = 180
 _cache = {
     "data": None,
@@ -34,33 +50,35 @@ _cache = {
 
 
 def run_pipeline():
-    df_raw = fetch_market_data()
-    if df_raw is None or df_raw.empty:
-        return None
+    try:
+        df_raw = fetch_market_data()
+        if df_raw is None or df_raw.empty:
+            return None
 
-    df_filtered = clean_and_filter_data(df_raw)
-    if df_filtered is None or df_filtered.empty:
-        return None
+        df_filtered = clean_and_filter_data(df_raw)
+        if df_filtered is None or df_filtered.empty:
+            return None
 
-    df_scored = score_coins(df_filtered)
-    if df_scored is None or df_scored.empty:
-        return None
+        df_scored = score_coins(df_filtered)
+        if df_scored is None or df_scored.empty:
+            return None
 
-    df_labeled = add_risk_labels(df_scored)
-    if df_labeled is None or df_labeled.empty:
-        return None
+        df_labeled = add_risk_labels(df_scored)
+        if df_labeled is None or df_labeled.empty:
+            return None
 
-    # اول explanation
-    df_final = add_explanations(df_labeled)
-    if df_final is None or df_final.empty:
-        return None
+        df_final = add_explanations(df_labeled)
+        if df_final is None or df_final.empty:
+            return None
 
-    # بعد prediction
-    df_final = add_prediction(df_final)
-    if df_final is None or df_final.empty:
-        return None
+        df_final = add_prediction(df_final)
+        if df_final is None or df_final.empty:
+            return None
 
-    return df_final
+        return df_final
+    except Exception as e:
+        print(f"[ERROR] Pipeline failed: {type(e).__name__}: {str(e).encode('ascii', errors='replace').decode()}")
+        return None
 
 
 def get_cached_pipeline():
@@ -141,6 +159,7 @@ def scan(limit: int = Query(6, ge=1, le=50)):
         )
 
     result = get_scan_mix(df, limit).to_dict(orient="records")
+    result = sanitize_records(result)
     return {
         "count": len(result),
         "cached": True,
@@ -158,6 +177,7 @@ def alerts(limit: int = Query(5, ge=1, le=20)):
         )
 
     result = get_alert_candidates(df, limit).to_dict(orient="records")
+    result = sanitize_records(result)
     return {
         "count": len(result),
         "cached": True,
@@ -175,6 +195,7 @@ def top_overall(limit: int = Query(10, ge=1, le=50)):
         )
 
     result = get_top_overall(df, limit).to_dict(orient="records")
+    result = sanitize_records(result)
     return {
         "count": len(result),
         "cached": True,
@@ -192,6 +213,7 @@ def top_momentum(limit: int = Query(10, ge=1, le=50)):
         )
 
     result = get_top_momentum(df, limit).to_dict(orient="records")
+    result = sanitize_records(result)
     return {
         "count": len(result),
         "cached": True,
@@ -209,6 +231,7 @@ def top_safer(limit: int = Query(10, ge=1, le=50)):
         )
 
     result = get_top_safer(df, limit).to_dict(orient="records")
+    result = sanitize_records(result)
     return {
         "count": len(result),
         "cached": True,

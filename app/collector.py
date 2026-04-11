@@ -12,17 +12,17 @@ from app.data_store import init_db, save_snapshot
 def run_pipeline():
     df_raw = fetch_market_data()
     if df_raw is None or df_raw.empty:
-        print("❌ No raw data")
+        print("[ERROR] No raw data")
         return None
 
     df_filtered = clean_and_filter_data(df_raw)
     if df_filtered is None or df_filtered.empty:
-        print("❌ No filtered data")
+        print("[ERROR] No filtered data")
         return None
 
     df_scored = score_coins(df_filtered)
     if df_scored is None or df_scored.empty:
-        print("❌ No scored data")
+        print("[ERROR] No scored data")
         return None
 
     df_labeled = add_risk_labels(df_scored)
@@ -35,14 +35,14 @@ def run_once():
     df = run_pipeline()
     if df is not None:
         save_snapshot(df)
-        print(f"✅ Snapshot saved: {len(df)} rows")
+        print(f"[OK] Snapshot saved: {len(df)} rows")
     else:
-        print("❌ Pipeline failed")
+        print("[ERROR] Pipeline failed")
 
 
 def loop(interval_seconds=900):
     while True:
-        print("📊 Collecting market snapshot...")
+        print("[INFO] Collecting market snapshot...")
         run_once()
         time.sleep(interval_seconds)
 
