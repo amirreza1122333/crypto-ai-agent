@@ -17,6 +17,8 @@ from app.news_scanner       import get_coin_news
 from app.social_scanner     import get_social_data
 from app.whale_tracker      import get_whale_signal
 from app.memory_store       import get_memory_score, init_memory_table, update_coin_memory
+from app.funding_rates      import get_funding_data
+from app.fear_greed         import get_fear_greed
 
 CACHE_TTL = 300  # 5 minutes
 _brain_cache:    dict  = {}
@@ -147,9 +149,54 @@ def analyze_coin_brain(symbol: str, coin_data: dict = None) -> dict:
         weight += 0.05
 
     # ------------------------------------------------------------------
+    # 7. Funding rates (bonus/penalty on top, no weight - modifier only)
+    # ------------------------------------------------------------------
+    funding_signal = "no_data"
+    funding_rate   = 0.0
+    try:
+        funding = get_funding_data(symbol)
+        if funding.get("available"):
+            funding_signal = funding.get("signal", "neutral")
+            funding_rate   = funding.get("funding_rate", 0.0)
+            adj            = funding.get("score_adj", 0)
+            if adj != 0:
+                brain_score_adj = adj   # applied after weight calc
+                for r in funding.get("reason", [])[:1]:
+                    reasons.append(f"Funding: {r}")
+    except Exception:
+        brain_score_adj = 0
+
+    # ------------------------------------------------------------------
+    # 8. Fear & Greed market context (modifier only, no weight)
+    # ------------------------------------------------------------------
+    fg_value = 50
+    try:
+        fg       = get_fear_greed()
+        fg_value = fg.get("value", 50)
+        # Extreme fear boosts score (buy opportunity), extreme greed penalizes
+        if fg_value <= 20:
+            reasons.append(f"Market in Extreme Fear ({fg_value}) - historically good entry")
+        elif fg_value >= 80:
+            reasons.append(f"Market in Extreme Greed ({fg_value}) - correction risk")
+    except Exception:
+        pass
+
+    # ------------------------------------------------------------------
     # Final score
     # ------------------------------------------------------------------
     brain_score = int(round(total / weight)) if weight > 0 else 50
+
+    # Apply funding rate modifier
+    try:
+        brain_score += brain_score_adj
+    except NameError:
+        pass
+
+    # Fear & Greed modifier
+    if fg_value <= 20:
+        brain_score += 5
+    elif fg_value >= 80:
+        brain_score -= 5
 
     # Penalty: if base scan score is very low
     base_score = float(coin_data.get("final_score", 0) or 0)
@@ -177,7 +224,10 @@ def analyze_coin_brain(symbol: str, coin_data: dict = None) -> dict:
         "ai_prob":       round(prob, 3),
         "news_sent":     news.get("sentiment", "neutral") if "news" in dir() else "neutral",
         "social_sent":   social.get("sentiment", "neutral") if "social" in dir() else "neutral",
-        "whale_signal":  whale.get("whale_signal", "normal") if "whale" in dir() else "normal",
+        "whale_signal":   whale.get("whale_signal", "normal") if "whale" in dir() else "normal",
+        "funding_signal": funding_signal,
+        "funding_rate":   funding_rate,
+        "fear_greed":     fg_value,
     }
 
 
@@ -225,10 +275,17 @@ def format_brain_text(symbol: str, coin_data: dict = None) -> str:
     else:
         lines.append("No strong signals found.")
 
+    funding_label = data.get("funding_signal", "no_data").replace("_", " ").title()
+    fg_val        = data.get("fear_greed", 50)
+    funding_rate  = data.get("funding_rate", 0.0)
+
     lines += [
         "",
         f"TA: {data['ta_score']}/100 | AI: {data['ai_prob']:.0%}",
         f"News: {data['news_sent']} | Reddit: {data['social_sent']}",
         f"Whale: {data['whale_signal'].replace('_', ' ').title()}",
     ]
+    if data.get("funding_signal", "no_data") != "no_data":
+        lines.append(f"Funding: {funding_rate:+.4f}%/8h ({funding_label})")
+    lines.append(f"Fear & Greed: {fg_val}/100")
     return "\n".join(lines)

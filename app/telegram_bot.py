@@ -14,11 +14,18 @@ from app.paper_trader import (
 from app.paper_trading_service import build_position_snapshot, fetch_market_results, find_coin
 from app.user_store import ensure_user, update_user, all_users
 from app.dex_scanner import scan_new_gems, GEM_ALERT_SCORE
-from app.brain import format_brain_text
+from app.brain import format_brain_text, analyze_coin_brain
 from app.news_scanner import format_news_text
 from app.social_scanner import format_social_text
 from app.whale_tracker import format_whale_text
 from app.memory_store import init_memory_table, get_trending_coins
+from app.fear_greed import format_fear_greed
+from app.funding_rates import format_funding_text
+from app.price_alerts import (
+    init_price_alerts_table, add_price_alert, format_user_alerts,
+    remove_price_alert, get_all_active_alerts, mark_alert_triggered,
+)
+from app.portfolio import init_portfolio_table, add_holding, remove_holding, get_holdings, format_portfolio
 
 # -----------------------------
 # Load ENV
@@ -47,8 +54,11 @@ DB_PATH = Path(__file__).resolve().parent.parent / "user_data.db"
 # هر چند ثانیه watchlist alert چک شود
 ALERT_POLL_SECONDS = 300
 ALERT_COOLDOWN_SECONDS = 1800
-GEM_POLL_SECONDS = 300          # scan for new gems every 5 min
-GEM_COOLDOWN_SECONDS = 3600     # don't re-alert same gem within 1 hour
+GEM_POLL_SECONDS        = 300   # scan for new gems every 5 min
+GEM_COOLDOWN_SECONDS    = 3600  # don't re-alert same gem within 1 hour
+PRICE_ALERT_POLL        = 300   # check price alerts every 5 min
+BRAIN_ALERT_THRESHOLD   = 72    # brain score threshold for brain alerts
+DAILY_REPORT_HOUR_UTC   = 8     # send daily report at 8am UTC
 
 # In-memory set of alerted gem token addresses (address:chain)
 _alerted_gems: set = set()
@@ -337,13 +347,12 @@ def send_message(chat_id: int, text: str) -> None:
 def send_menu(chat_id: int) -> None:
     keyboard = {
         "keyboard": [
-            [{"text": "/overall"}, {"text": "/momentum"}],
-            [{"text": "/safer"}, {"text": "/scan"}],
-            [{"text": "/alerts"}, {"text": "/watchlist"}],
-            [{"text": "/refresh"}, {"text": "/settings"}],
-            [{"text": "/alerts_on"}, {"text": "/alerts_off"}],
-            [{"text": "/help"}],
+            [{"text": "/overall"}, {"text": "/momentum"}, {"text": "/safer"}],
+            [{"text": "/scan"}, {"text": "/alerts"}, {"text": "/newgems"}],
+            [{"text": "/feargreed"}, {"text": "/trending"}, {"text": "/report"}],
+            [{"text": "/watchlist"}, {"text": "/refresh"}, {"text": "/settings"}],
             [{"text": "/paper_positions"}, {"text": "/paper_stats"}],
+            [{"text": "/port"}, {"text": "/myalerts"}, {"text": "/help"}],
         ],
         "resize_keyboard": True,
         "one_time_keyboard": False,
@@ -353,10 +362,34 @@ def send_menu(chat_id: int) -> None:
         f"{BASE}/sendMessage",
         json={
             "chat_id": chat_id,
-            "text": "👇 منوی بات آماده است",
+            "text": "Menu ready. Use commands below or type /help for full list.",
             "reply_markup": keyboard,
         },
         timeout=20,
+    )
+
+
+def send_inline_buttons(chat_id: int, text: str, buttons: list) -> None:
+    """Send a message with inline keyboard buttons.
+    buttons: list of {"text": "label", "callback_data": "data"} dicts (per row)
+    """
+    keyboard = {"inline_keyboard": [buttons]}
+    requests.post(
+        f"{BASE}/sendMessage",
+        json={
+            "chat_id": chat_id,
+            "text": text,
+            "reply_markup": keyboard,
+        },
+        timeout=20,
+    )
+
+
+def answer_callback(callback_query_id: str) -> None:
+    requests.post(
+        f"{BASE}/answerCallbackQuery",
+        json={"callback_query_id": callback_query_id},
+        timeout=10,
     )
 
 
@@ -485,10 +518,23 @@ def help_text() -> str:
         "/refresh - refresh cache\n\n"
         "--- Brain / AI ---\n"
         "/brain BTC - full AI brain analysis\n"
+        "/braintop - top 10 coins by brain score\n"
+        "/compare BTC ETH - side-by-side comparison\n"
         "/news BTC - latest news + sentiment\n"
         "/social BTC - Reddit mentions + sentiment\n"
         "/whales BTC - whale & volume activity\n"
-        "/trending - coins consistently in scans\n\n"
+        "/funding BTC - Binance funding rates\n"
+        "/feargreed - crypto fear & greed index\n"
+        "/trending - coins consistently in scans\n"
+        "/report - full market report now\n\n"
+        "--- Price Alerts ---\n"
+        "/setalert BTC 100000 - alert when BTC hits price\n"
+        "/myalerts - list your active price alerts\n"
+        "/delalert 3 - remove alert by ID\n\n"
+        "--- Portfolio ---\n"
+        "/port - show portfolio P&L\n"
+        "/port add BTC 0.5 95000 - add holding\n"
+        "/port remove BTC - remove holding\n\n"
         "--- Watchlist & Alerts ---\n"
         "/watch BTC - add to watchlist\n"
         "/unwatch BTC - remove from watchlist\n"
@@ -737,9 +783,181 @@ def alert_loop():
     while True:
         try:
             send_watchlist_alerts()
+            send_brain_alerts()
         except Exception as e:
             print("ALERT LOOP ERROR:", e)
         time.sleep(ALERT_POLL_SECONDS)
+
+
+def send_brain_alerts():
+    """Alert watchlist users when brain score crosses BRAIN_ALERT_THRESHOLD."""
+    try:
+        users = get_all_watchlist_users()
+        if not users:
+            return
+
+        data    = api("/scan?limit=50")
+        results = data.get("results", [])
+        if not results:
+            return
+
+        # Build brain scores for all scan results in one pass
+        from app.brain import get_brain_report
+        brain_map = get_brain_report(results)
+
+        for chat_id in users:
+            settings = ensure_user(chat_id)
+            if not settings.get("alerts_enabled", True):
+                continue
+
+            watchlist = get_watchlist(chat_id)
+            for sym in watchlist:
+                brain = brain_map.get(sym.upper())
+                if not brain:
+                    continue
+                score = brain.get("brain_score", 0)
+                if score < BRAIN_ALERT_THRESHOLD:
+                    continue
+
+                # Use alert_state table to avoid spam (reuse existing cooldown)
+                fake_coin = {"symbol": sym, "pump_probability_6h": score / 100, "ai_signal": f"Brain:{score}"}
+                if not should_send_alert_advanced(chat_id, fake_coin):
+                    continue
+
+                reasons = "\n".join(f"  - {r}" for r in brain.get("brain_reason", [])[:3])
+                msg = (
+                    f"Brain Alert: {sym.upper()}\n\n"
+                    f"Brain Score: {score}/100\n"
+                    f"Signal: {brain.get('brain_signal', '-')}\n\n"
+                    f"Detected:\n{reasons}"
+                )
+                send_message(chat_id, msg)
+                mark_alert_sent_advanced(chat_id, fake_coin)
+
+    except Exception as e:
+        print(f"[BRAIN ALERT] Error: {e}")
+
+
+def price_alert_loop():
+    """Check price alerts against current scan data."""
+    time.sleep(60)  # wait for bot to start
+    while True:
+        try:
+            alerts = get_all_active_alerts()
+            if alerts:
+                data    = api("/scan?limit=100")
+                results = data.get("results", [])
+                prices  = {str(c.get("symbol", "")).upper(): float(c.get("current_price", 0) or 0)
+                           for c in results}
+
+                for alert in alerts:
+                    sym   = alert["symbol"]
+                    price = prices.get(sym, 0)
+                    if price <= 0:
+                        continue
+
+                    target    = alert["target"]
+                    direction = alert["direction"]
+                    triggered = (direction == "above" and price >= target) or \
+                                (direction == "below" and price <= target)
+
+                    if triggered:
+                        dir_label = "risen above" if direction == "above" else "dropped below"
+                        msg = (
+                            f"Price Alert Triggered!\n\n"
+                            f"{sym} has {dir_label} ${target:,.4f}\n"
+                            f"Current price: ${price:,.4f}"
+                        )
+                        send_message(alert["chat_id"], msg)
+                        mark_alert_triggered(alert["id"])
+
+        except Exception as e:
+            print(f"[PRICE ALERT] Error: {e}")
+
+        time.sleep(PRICE_ALERT_POLL)
+
+
+def daily_report_loop():
+    """Send a daily summary to all users at DAILY_REPORT_HOUR_UTC."""
+    import datetime
+    last_sent_date = None
+
+    time.sleep(120)  # wait for everything to start
+    while True:
+        try:
+            now_utc = datetime.datetime.utcnow()
+            today   = now_utc.date()
+
+            if now_utc.hour == DAILY_REPORT_HOUR_UTC and last_sent_date != today:
+                last_sent_date = today
+                users = all_users()
+                if not users:
+                    time.sleep(3600)
+                    continue
+
+                # Build report
+                try:
+                    from app.fear_greed import get_fear_greed, fear_greed_context
+                    fg      = get_fear_greed()
+                    fg_val  = fg["value"]
+                    fg_lab  = fg["label"]
+                    fg_ctx  = fear_greed_context(fg_val)
+                except Exception:
+                    fg_val, fg_lab, fg_ctx = 50, "Neutral", "No data"
+
+                try:
+                    top_data = api("/top-overall?limit=5")
+                    top_coins = top_data.get("results", [])
+                except Exception:
+                    top_coins = []
+
+                try:
+                    from app.brain import get_brain_report
+                    brain_data = get_brain_report(top_coins[:10])
+                    top_brain  = sorted(brain_data.values(), key=lambda x: x["brain_score"], reverse=True)[:3]
+                except Exception:
+                    top_brain = []
+
+                bar = "#" * (fg_val // 10) + "-" * (10 - fg_val // 10)
+                report = [
+                    f"Daily Report",
+                    f"",
+                    f"Fear & Greed: {fg_val}/100 [{bar}]",
+                    f"Status: {fg_lab} - {fg_ctx}",
+                    f"",
+                ]
+
+                if top_coins:
+                    report.append("Top Coins Today:")
+                    for i, c in enumerate(top_coins[:5], 1):
+                        sym   = str(c.get("symbol", "")).upper()
+                        score = c.get("final_score", 0)
+                        prob  = c.get("pump_probability_6h", 0)
+                        report.append(f"  {i}. {sym} | Score: {score:.3f} | AI: {prob:.0%}")
+
+                if top_brain:
+                    report.append("")
+                    report.append("Brain Picks:")
+                    for b in top_brain:
+                        report.append(
+                            f"  {b['symbol']}: {b['brain_score']}/100 - {b['brain_signal']}"
+                        )
+
+                report.append("")
+                report.append("Have a great trading day!")
+
+                msg = "\n".join(report)
+                for uid in users:
+                    try:
+                        send_message(int(uid), msg)
+                        time.sleep(0.3)
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            print(f"[DAILY REPORT] Error: {e}")
+
+        time.sleep(3600)  # check every hour
 
 
 # -----------------------------
@@ -764,6 +982,25 @@ def main():
 
             for upd in data.get("result", []):
                 offset = upd["update_id"] + 1
+
+                # Handle inline keyboard callbacks
+                cb = upd.get("callback_query")
+                if cb:
+                    answer_callback(cb["id"])
+                    cb_chat = cb["from"]["id"]
+                    cb_data = cb.get("data", "")
+                    ensure_user(cb_chat)
+                    if cb_data.startswith("brain:"):
+                        sym = cb_data.split(":", 1)[1]
+                        send_message(cb_chat, f"Analyzing {sym}...")
+                        send_message(cb_chat, format_brain_text(sym))
+                    elif cb_data.startswith("news:"):
+                        sym = cb_data.split(":", 1)[1]
+                        send_message(cb_chat, format_news_text(sym))
+                    elif cb_data.startswith("funding:"):
+                        sym = cb_data.split(":", 1)[1]
+                        send_message(cb_chat, format_funding_text(sym))
+                    continue
 
                 msg = upd.get("message")
                 if not msg:
@@ -1023,12 +1260,183 @@ def main():
                         for i, c in enumerate(coins, 1):
                             lines.append(
                                 f"{i}. {c['symbol']} | Score: {c['avg_score']:.3f} | "
-                                f"Seen: {c['scan_count']}x | Row: {c['consecutive']} in a row"
+                                f"Seen: {c['scan_count']}x | {c['consecutive']} in a row"
                             )
                         send_message(chat_id, "\n".join(lines))
 
+                elif text == "/feargreed":
+                    send_message(chat_id, format_fear_greed())
+
+                elif text.startswith("/funding"):
+                    parts = text.split(maxsplit=1)
+                    if len(parts) < 2 or not parts[1].strip():
+                        send_message(chat_id, "Usage: /funding BTC\nExample: /funding ETH")
+                    else:
+                        send_message(chat_id, format_funding_text(parts[1].strip().upper()))
+
+                elif text == "/braintop":
+                    send_message(chat_id, "Building brain scores for top coins...")
+                    try:
+                        top_data = api("/scan?limit=20")
+                        top_results = top_data.get("results", [])
+                        from app.brain import get_brain_report
+                        brain_map = get_brain_report(top_results)
+                        ranked = sorted(brain_map.values(), key=lambda x: x["brain_score"], reverse=True)[:10]
+                        lines = ["Brain Leaderboard (Top 10)\n"]
+                        for i, b in enumerate(ranked, 1):
+                            lines.append(
+                                f"{i}. {b['symbol']}: {b['brain_score']}/100 - {b['brain_signal']}"
+                            )
+                        send_message(chat_id, "\n".join(lines))
+                    except Exception as e:
+                        send_message(chat_id, f"Error building brain leaderboard: {e}")
+
+                elif text.startswith("/compare"):
+                    parts = text.split()
+                    if len(parts) != 3:
+                        send_message(chat_id, "Usage: /compare BTC ETH")
+                    else:
+                        sym1, sym2 = parts[1].upper(), parts[2].upper()
+                        send_message(chat_id, f"Comparing {sym1} vs {sym2}...")
+                        try:
+                            scan_data = api("/scan?limit=50")
+                            results   = scan_data.get("results", [])
+                            c1 = next((c for c in results if str(c.get("symbol","")).upper() == sym1), {})
+                            c2 = next((c for c in results if str(c.get("symbol","")).upper() == sym2), {})
+                            b1 = analyze_coin_brain(sym1, c1)
+                            b2 = analyze_coin_brain(sym2, c2)
+                            def pad(s, n=12): return str(s)[:n].ljust(n)
+                            lines = [
+                                f"Comparison: {sym1} vs {sym2}\n",
+                                f"{'Metric':<14} {pad(sym1):<12} {pad(sym2)}",
+                                f"{'-'*38}",
+                                f"{'Brain Score':<14} {b1['brain_score']:<12} {b2['brain_score']}",
+                                f"{'Signal':<14} {pad(b1['brain_signal']):<12} {pad(b2['brain_signal'])}",
+                                f"{'TA Score':<14} {b1['ta_score']:<12} {b2['ta_score']}",
+                                f"{'AI Prob':<14} {b1['ai_prob']:.0%}{'':8} {b2['ai_prob']:.0%}",
+                                f"{'News':<14} {pad(b1['news_sent']):<12} {pad(b2['news_sent'])}",
+                                f"{'Reddit':<14} {pad(b1['social_sent']):<12} {pad(b2['social_sent'])}",
+                                f"{'Whale':<14} {pad(b1['whale_signal']):<12} {pad(b2['whale_signal'])}",
+                                f"{'F&G':<14} {b1['fear_greed']:<12} {b2['fear_greed']}",
+                            ]
+                            winner = sym1 if b1["brain_score"] >= b2["brain_score"] else sym2
+                            lines.append(f"\nEdge: {winner} has the stronger brain score")
+                            send_message(chat_id, "\n".join(lines))
+                        except Exception as e:
+                            send_message(chat_id, f"Compare error: {e}")
+
+                elif text == "/report":
+                    try:
+                        from app.fear_greed import get_fear_greed, fear_greed_context
+                        fg     = get_fear_greed()
+                        fg_val = fg["value"]
+                        fg_lab = fg["label"]
+                        bar    = "#" * (fg_val // 10) + "-" * (10 - fg_val // 10)
+                        top    = api("/top-overall?limit=5").get("results", [])
+                        from app.brain import get_brain_report
+                        brain_data = get_brain_report(top)
+                        top_brain  = sorted(brain_data.values(), key=lambda x: x["brain_score"], reverse=True)[:3]
+
+                        report = [
+                            "Market Report\n",
+                            f"Fear & Greed: {fg_val}/100 [{bar}]",
+                            f"Status: {fg_lab} - {fear_greed_context(fg_val)}",
+                            "",
+                            "Top Coins:",
+                        ]
+                        for i, c in enumerate(top[:5], 1):
+                            sym   = str(c.get("symbol","")).upper()
+                            score = c.get("final_score", 0)
+                            prob  = c.get("pump_probability_6h", 0)
+                            report.append(f"  {i}. {sym} | Score: {score:.3f} | AI: {prob:.0%}")
+
+                        if top_brain:
+                            report += ["", "Brain Picks:"]
+                            for b in top_brain:
+                                report.append(f"  {b['symbol']}: {b['brain_score']}/100 - {b['brain_signal']}")
+
+                        send_message(chat_id, "\n".join(report))
+                    except Exception as e:
+                        send_message(chat_id, f"Report error: {e}")
+
+                elif text.startswith("/setalert"):
+                    parts = text.split()
+                    if len(parts) != 3:
+                        send_message(chat_id, "Usage: /setalert BTC 100000\nBot detects above/below automatically.")
+                    else:
+                        try:
+                            sym    = parts[1].upper()
+                            target = float(parts[2].replace(",", ""))
+                            # Detect direction from current price
+                            scan_data = api("/scan?limit=100")
+                            results   = scan_data.get("results", [])
+                            coin      = next((c for c in results if str(c.get("symbol","")).upper() == sym), None)
+                            if coin:
+                                cur_price = float(coin.get("current_price", 0) or 0)
+                                direction = "above" if target > cur_price else "below"
+                            else:
+                                direction = "above"  # default fallback
+                            alert_id = add_price_alert(chat_id, sym, target, direction)
+                            send_message(
+                                chat_id,
+                                f"Price alert set!\n{sym} {direction} ${target:,.4f}\nAlert ID: {alert_id}"
+                            )
+                        except ValueError:
+                            send_message(chat_id, "Invalid price. Example: /setalert BTC 100000")
+
+                elif text == "/myalerts":
+                    send_message(chat_id, format_user_alerts(chat_id))
+
+                elif text.startswith("/delalert"):
+                    parts = text.split()
+                    if len(parts) != 2:
+                        send_message(chat_id, "Usage: /delalert <ID>\nSee IDs with /myalerts")
+                    else:
+                        try:
+                            alert_id = int(parts[1])
+                            ok = remove_price_alert(chat_id, alert_id)
+                            send_message(chat_id, "Alert removed." if ok else "Alert not found.")
+                        except ValueError:
+                            send_message(chat_id, "Invalid ID. Example: /delalert 3")
+
+                elif text.startswith("/port"):
+                    parts = text.split(maxsplit=1)
+                    sub   = parts[1].strip() if len(parts) > 1 else ""
+
+                    if not sub or sub == "show":
+                        # Show portfolio with live prices
+                        scan_data = api("/scan?limit=200")
+                        results   = scan_data.get("results", [])
+                        live      = {str(c.get("symbol","")).upper(): float(c.get("current_price",0) or 0)
+                                     for c in results}
+                        send_message(chat_id, format_portfolio(chat_id, live))
+
+                    elif sub.startswith("add "):
+                        tokens = sub.split()
+                        if len(tokens) != 4:
+                            send_message(chat_id, "Usage: /port add BTC 0.5 95000\n(symbol, quantity, avg buy price)")
+                        else:
+                            try:
+                                sym   = tokens[1].upper()
+                                qty   = float(tokens[2])
+                                price = float(tokens[3].replace(",", ""))
+                                action = add_holding(chat_id, sym, qty, price)
+                                send_message(chat_id, f"Portfolio {action}: {qty} {sym} @ ${price:,.4f}")
+                            except ValueError:
+                                send_message(chat_id, "Invalid numbers. Example: /port add BTC 0.5 95000")
+
+                    elif sub.startswith("remove "):
+                        sym = sub.split()[1].upper() if len(sub.split()) > 1 else ""
+                        if not sym:
+                            send_message(chat_id, "Usage: /port remove BTC")
+                        else:
+                            ok = remove_holding(chat_id, sym)
+                            send_message(chat_id, f"Removed {sym} from portfolio." if ok else f"{sym} not in portfolio.")
+                    else:
+                        send_message(chat_id, "Portfolio commands:\n/port - show\n/port add BTC 0.5 95000\n/port remove BTC")
+
                 else:
-                    send_message(chat_id, f"echo: {text}")
+                    send_message(chat_id, f"Unknown command: {text}\nType /help for all commands.")
 
         except Exception as e:
             print("ERROR:", e)
@@ -1037,10 +1445,13 @@ def main():
 
 if __name__ == "__main__":
     init_db()
-    try:
-        init_memory_table()
-    except Exception:
-        pass
-    threading.Thread(target=alert_loop, daemon=True).start()
-    threading.Thread(target=gem_alert_loop, daemon=True).start()
+    for init_fn in [init_memory_table, init_price_alerts_table, init_portfolio_table]:
+        try:
+            init_fn()
+        except Exception:
+            pass
+    threading.Thread(target=alert_loop,       daemon=True).start()
+    threading.Thread(target=gem_alert_loop,   daemon=True).start()
+    threading.Thread(target=price_alert_loop, daemon=True).start()
+    threading.Thread(target=daily_report_loop, daemon=True).start()
     main()

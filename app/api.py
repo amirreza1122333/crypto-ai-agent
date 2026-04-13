@@ -25,6 +25,8 @@ from app.news_scanner import format_news_text
 from app.social_scanner import format_social_text
 from app.whale_tracker import format_whale_text
 from app.memory_store import init_memory_table, get_trending_coins
+from app.fear_greed import get_fear_greed
+from app.funding_rates import get_funding_data
 
 
 app = FastAPI(
@@ -367,3 +369,15 @@ def trending_coins(min_scans: int = Query(3, ge=1), limit: int = Query(10, ge=1,
     """Coins that have appeared consistently across multiple scan cycles."""
     coins = get_trending_coins(min_scans=min_scans, limit=limit)
     return {"count": len(coins), "results": coins}
+
+
+@app.get("/fear-greed")
+def fear_greed():
+    """Crypto Fear & Greed Index from alternative.me."""
+    return get_fear_greed()
+
+
+@app.get("/funding/{symbol}")
+def funding_symbol(symbol: str):
+    """Binance futures funding rate + open interest for a symbol."""
+    return {"symbol": symbol.upper(), **get_funding_data(symbol.upper())}
