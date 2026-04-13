@@ -30,6 +30,7 @@ def ensure_user(chat_id: int) -> dict:
     if key not in users:
         users[key] = {
             "alerts_enabled": True,
+            "gems_enabled": True,
             "min_score": 0.55,
             "scan_limit": 5,
             "favorite_bucket": "any",
@@ -46,6 +47,7 @@ def update_user(chat_id: int, **kwargs) -> dict:
     if key not in users:
         users[key] = {
             "alerts_enabled": True,
+            "gems_enabled": True,
             "min_score": 0.55,
             "scan_limit": 5,
             "favorite_bucket": "any",

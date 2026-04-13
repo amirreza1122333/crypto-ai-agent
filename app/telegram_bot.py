@@ -12,7 +12,8 @@ from app.paper_trader import (
     get_closed_stats,
 )
 from app.paper_trading_service import build_position_snapshot, fetch_market_results, find_coin
-from app.user_store import ensure_user, update_user
+from app.user_store import ensure_user, update_user, all_users
+from app.dex_scanner import scan_new_gems, GEM_ALERT_SCORE
 
 # -----------------------------
 # Load ENV
@@ -40,9 +41,12 @@ DB_PATH = Path(__file__).resolve().parent.parent / "user_data.db"
 
 # هر چند ثانیه watchlist alert چک شود
 ALERT_POLL_SECONDS = 300
-
-# برای جلوگیری از اسپم، تا این مدت برای یک symbol دوباره alert نفرست
 ALERT_COOLDOWN_SECONDS = 1800
+GEM_POLL_SECONDS = 300          # scan for new gems every 5 min
+GEM_COOLDOWN_SECONDS = 3600     # don't re-alert same gem within 1 hour
+
+# In-memory set of alerted gem token addresses (address:chain)
+_alerted_gems: set = set()
 
 
 def init_db():
@@ -114,6 +118,13 @@ CREATE TABLE IF NOT EXISTS paper_account (
     equity REAL NOT NULL DEFAULT 10000
 )
 """)
+    c.execute("""
+CREATE TABLE IF NOT EXISTS gem_alerted (
+    token_key TEXT PRIMARY KEY,
+    alerted_ts INTEGER NOT NULL
+)
+""")
+
     conn.commit()
     conn.close()
 
@@ -478,6 +489,9 @@ def help_text() -> str:
         "/paper_close TAO - close paper position\n"
         "/paper_positions - show open paper trades\n"
         "/paper_stats - show paper trading stats\n"
+        "/newgems - scan for new gem launches\n"
+        "/gems_on - enable gem alerts\n"
+        "/gems_off - disable gem alerts\n"
     )
 
 
@@ -486,10 +500,114 @@ def settings_text(chat_id: int) -> str:
     return (
         "⚙️ Your Settings\n\n"
         f"alerts_enabled: {settings.get('alerts_enabled')}\n"
+        f"gems_enabled: {settings.get('gems_enabled', True)}\n"
         f"min_score: {settings.get('min_score')}\n"
         f"scan_limit: {settings.get('scan_limit')}\n"
         f"favorite_bucket: {settings.get('favorite_bucket')}\n"
     )
+
+
+def format_gems(gems: list) -> str:
+    if not gems:
+        return "💎 New Gem Scanner\n\nNo new gems found right now.\nTry again in a few minutes."
+
+    text = "💎 New Gem Scanner\n\n"
+    for i, g in enumerate(gems, 1):
+        age = g["age_hours"]
+        age_str = f"{age:.0f}h" if age < 48 else f"{age/24:.1f}d"
+        fdv = g["fdv"]
+        fdv_str = f"${fdv/1_000_000:.1f}M" if fdv >= 1_000_000 else f"${fdv/1_000:.0f}K"
+        vol_str = f"${g['volume_24h']/1_000:.0f}K" if g['volume_24h'] < 1_000_000 else f"${g['volume_24h']/1_000_000:.1f}M"
+        liq_str = f"${g['liquidity_usd']/1_000:.0f}K" if g['liquidity_usd'] < 1_000_000 else f"${g['liquidity_usd']/1_000_000:.1f}M"
+
+        text += (
+            f"{i}. {g['name']} ({g['symbol'].upper()}) [{g['chain'].upper()}]\n"
+            f"Price: ${g['price_usd']:.6f}\n"
+            f"24h: +{g['price_change_24h']:.1f}% | 1h: {g['price_change_1h']:+.1f}%\n"
+            f"Vol: {vol_str} | Liq: {liq_str} | FDV: {fdv_str}\n"
+            f"Age: {age_str} | Buys/Sells: {g['buys_24h']}/{g['sells_24h']}\n"
+            f"Gem Score: {g['gem_score']}/100\n"
+        )
+        if g.get("url"):
+            text += f"Chart: {g['url']}\n"
+        text += "\n"
+
+    text += "DYOR - high risk, new tokens can rug."
+    return text.strip()
+
+
+def _is_gem_alerted(token_key: str) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT alerted_ts FROM gem_alerted WHERE token_key=?", (token_key,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return False
+    return (int(time.time()) - row[0]) < GEM_COOLDOWN_SECONDS
+
+
+def _mark_gem_alerted(token_key: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "INSERT OR REPLACE INTO gem_alerted (token_key, alerted_ts) VALUES (?, ?)",
+        (token_key, int(time.time()))
+    )
+    conn.commit()
+    conn.close()
+
+
+def gem_alert_loop():
+    time.sleep(30)  # wait for bot to fully start
+    while True:
+        try:
+            users = all_users()
+            gem_users = [
+                int(uid) for uid, s in users.items()
+                if s.get("gems_enabled", True)
+            ]
+
+            if gem_users:
+                print("[GEM] Scanning for new gems...")
+                gems = scan_new_gems(max_results=5)
+
+                for gem in gems:
+                    if gem["gem_score"] < GEM_ALERT_SCORE:
+                        continue
+
+                    token_key = f"{gem['token_address']}:{gem['chain']}"
+                    if _is_gem_alerted(token_key):
+                        continue
+
+                    _mark_gem_alerted(token_key)
+
+                    age = gem["age_hours"]
+                    age_str = f"{age:.0f}h" if age < 48 else f"{age/24:.1f}d"
+                    msg = (
+                        f"💎 NEW GEM ALERT\n\n"
+                        f"{gem['name']} ({gem['symbol'].upper()}) [{gem['chain'].upper()}]\n"
+                        f"Price: ${gem['price_usd']:.6f}\n"
+                        f"24h: +{gem['price_change_24h']:.1f}%\n"
+                        f"Vol: ${gem['volume_24h']:,.0f}\n"
+                        f"Liq: ${gem['liquidity_usd']:,.0f}\n"
+                        f"Age: {age_str} | Score: {gem['gem_score']}/100\n"
+                    )
+                    if gem.get("url"):
+                        msg += f"Chart: {gem['url']}\n"
+                    msg += "\nDYOR - high risk!"
+
+                    for chat_id in gem_users:
+                        try:
+                            send_message(chat_id, msg)
+                            time.sleep(0.3)
+                        except Exception:
+                            pass
+
+        except Exception as e:
+            print(f"[GEM] Loop error: {e}")
+
+        time.sleep(GEM_POLL_SECONDS)
 
 
 # -----------------------------
@@ -823,6 +941,19 @@ def main():
                         except ValueError:
                             send_message(chat_id, "❌ invalid score. Example: /setscore 0.60")
 
+                elif text == "/newgems":
+                    send_message(chat_id, "Scanning for new gems... this may take 30 seconds.")
+                    gems = scan_new_gems(max_results=8)
+                    send_message(chat_id, format_gems(gems))
+
+                elif text == "/gems_on":
+                    update_user(chat_id, gems_enabled=True)
+                    send_message(chat_id, "💎 Gem alerts turned ON")
+
+                elif text == "/gems_off":
+                    update_user(chat_id, gems_enabled=False)
+                    send_message(chat_id, "Gem alerts turned OFF")
+
                 else:
                     send_message(chat_id, f"echo: {text}")
 
@@ -834,4 +965,5 @@ def main():
 if __name__ == "__main__":
     init_db()
     threading.Thread(target=alert_loop, daemon=True).start()
+    threading.Thread(target=gem_alert_loop, daemon=True).start()
     main()
