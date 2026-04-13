@@ -14,6 +14,11 @@ from app.paper_trader import (
 from app.paper_trading_service import build_position_snapshot, fetch_market_results, find_coin
 from app.user_store import ensure_user, update_user, all_users
 from app.dex_scanner import scan_new_gems, GEM_ALERT_SCORE
+from app.brain import format_brain_text
+from app.news_scanner import format_news_text
+from app.social_scanner import format_social_text
+from app.whale_tracker import format_whale_text
+from app.memory_store import init_memory_table, get_trending_coins
 
 # -----------------------------
 # Load ENV
@@ -470,28 +475,38 @@ def format_alerts(data: dict, limit: int = 5) -> str:
 
 def help_text() -> str:
     return (
-        "🤖 Crypto Bot Help\n\n"
-        "/start - start bot\n"
+        "Crypto Bot Help\n\n"
+        "--- Market Analysis ---\n"
         "/overall - top overall coins\n"
         "/momentum - top momentum coins\n"
         "/safer - safer coins\n"
         "/scan - mixed signal scan\n"
         "/alerts - top alert candidates\n"
-        "/watch BTC - add symbol to watchlist\n"
-        "/unwatch BTC - remove symbol from watchlist\n"
+        "/refresh - refresh cache\n\n"
+        "--- Brain / AI ---\n"
+        "/brain BTC - full AI brain analysis\n"
+        "/news BTC - latest news + sentiment\n"
+        "/social BTC - Reddit mentions + sentiment\n"
+        "/whales BTC - whale & volume activity\n"
+        "/trending - coins consistently in scans\n\n"
+        "--- Watchlist & Alerts ---\n"
+        "/watch BTC - add to watchlist\n"
+        "/unwatch BTC - remove from watchlist\n"
         "/watchlist - show your watchlist\n"
-        "/refresh - refresh cache\n"
-        "/settings - your current settings\n"
         "/alerts_on - enable alerts\n"
         "/alerts_off - disable alerts\n"
-        "/setscore 0.60 - set minimum score for alerts\n"
+        "/setscore 0.60 - set minimum alert score\n\n"
+        "--- Paper Trading ---\n"
         "/paper_open TAO 10 - open paper position\n"
         "/paper_close TAO - close paper position\n"
-        "/paper_positions - show open paper trades\n"
-        "/paper_stats - show paper trading stats\n"
+        "/paper_positions - show open trades\n"
+        "/paper_stats - trading stats\n\n"
+        "--- Gems ---\n"
         "/newgems - scan for new gem launches\n"
         "/gems_on - enable gem alerts\n"
-        "/gems_off - disable gem alerts\n"
+        "/gems_off - disable gem alerts\n\n"
+        "/settings - your current settings\n"
+        "/start - restart bot\n"
     )
 
 
@@ -954,6 +969,64 @@ def main():
                     update_user(chat_id, gems_enabled=False)
                     send_message(chat_id, "Gem alerts turned OFF")
 
+                elif text.startswith("/brain"):
+                    parts = text.split(maxsplit=1)
+                    if len(parts) < 2 or not parts[1].strip():
+                        send_message(chat_id, "Usage: /brain BTC\nExample: /brain ETH")
+                    else:
+                        sym = parts[1].strip().upper()
+                        send_message(chat_id, f"Analyzing brain signals for {sym}...")
+                        # Try to get coin data from scan for richer analysis
+                        try:
+                            scan_data = api("/scan?limit=50")
+                            coin_data = next(
+                                (c for c in scan_data.get("results", [])
+                                 if str(c.get("symbol", "")).upper() == sym),
+                                {}
+                            )
+                        except Exception:
+                            coin_data = {}
+                        send_message(chat_id, format_brain_text(sym, coin_data))
+
+                elif text.startswith("/news"):
+                    parts = text.split(maxsplit=1)
+                    if len(parts) < 2 or not parts[1].strip():
+                        send_message(chat_id, "Usage: /news BTC\nExample: /news ETH")
+                    else:
+                        sym = parts[1].strip().upper()
+                        send_message(chat_id, f"Fetching news for {sym}...")
+                        send_message(chat_id, format_news_text(sym))
+
+                elif text.startswith("/social"):
+                    parts = text.split(maxsplit=1)
+                    if len(parts) < 2 or not parts[1].strip():
+                        send_message(chat_id, "Usage: /social BTC\nExample: /social ETH")
+                    else:
+                        sym = parts[1].strip().upper()
+                        send_message(chat_id, f"Scanning Reddit for {sym}...")
+                        send_message(chat_id, format_social_text(sym))
+
+                elif text.startswith("/whales"):
+                    parts = text.split(maxsplit=1)
+                    if len(parts) < 2 or not parts[1].strip():
+                        send_message(chat_id, "Usage: /whales BTC\nExample: /whales ETH")
+                    else:
+                        sym = parts[1].strip().upper()
+                        send_message(chat_id, format_whale_text(sym))
+
+                elif text == "/trending":
+                    coins = get_trending_coins(min_scans=3, limit=10)
+                    if not coins:
+                        send_message(chat_id, "No trending coins tracked yet.\nRun /scan a few times to build memory.")
+                    else:
+                        lines = ["Trending Coins (consistently in scans)\n"]
+                        for i, c in enumerate(coins, 1):
+                            lines.append(
+                                f"{i}. {c['symbol']} | Score: {c['avg_score']:.3f} | "
+                                f"Seen: {c['scan_count']}x | Row: {c['consecutive']} in a row"
+                            )
+                        send_message(chat_id, "\n".join(lines))
+
                 else:
                     send_message(chat_id, f"echo: {text}")
 
@@ -964,6 +1037,10 @@ def main():
 
 if __name__ == "__main__":
     init_db()
+    try:
+        init_memory_table()
+    except Exception:
+        pass
     threading.Thread(target=alert_loop, daemon=True).start()
     threading.Thread(target=gem_alert_loop, daemon=True).start()
     main()

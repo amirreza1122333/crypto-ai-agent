@@ -20,13 +20,24 @@ from app.reporter import (
     get_scan_mix,
 )
 from app.export_utils import dataframe_to_csv_text
+from app.brain import format_brain_text, analyze_coin_brain, get_brain_report
+from app.news_scanner import format_news_text
+from app.social_scanner import format_social_text
+from app.whale_tracker import format_whale_text
+from app.memory_store import init_memory_table, get_trending_coins
 
 
 app = FastAPI(
     title="Crypto AI Agent API",
-    version="1.3.0",
+    version="1.4.0",
     description="Scan, score, classify, explain, and export crypto market candidates."
 )
+
+# Initialize memory table on startup
+try:
+    init_memory_table()
+except Exception:
+    pass
 
 def sanitize_records(records):
     """Replace NaN/Infinity with None for JSON serialization."""
@@ -289,3 +300,70 @@ def export_full_scan(limit: int = Query(100, ge=1, le=1000)):
 
     export_df = get_scan_mix(df, limit)
     return make_csv_response(export_df, "full_scan.csv")
+
+
+# ------------------------------------------------------------------
+# Brain / intelligence endpoints
+# ------------------------------------------------------------------
+
+@app.get("/brain/{symbol}")
+def brain_coin(symbol: str):
+    """Full brain analysis for a specific coin symbol."""
+    symbol = symbol.upper()
+    df = get_cached_pipeline()
+    coin_data = {}
+    if df is not None and "symbol" in df.columns:
+        match = df[df["symbol"].str.upper() == symbol]
+        if not match.empty:
+            row = match.iloc[0].to_dict()
+            coin_data = {k: (None if isinstance(v, float) and (math.isnan(v) or math.isinf(v)) else v)
+                         for k, v in row.items()}
+
+    result = analyze_coin_brain(symbol, coin_data)
+    return result
+
+
+@app.get("/brain")
+def brain_top(limit: int = Query(10, ge=1, le=30)):
+    """Brain analysis for top scan coins, sorted by brain_score."""
+    df = get_cached_pipeline()
+    if df is None:
+        return JSONResponse(status_code=503, content={"error": "No data available."})
+
+    top_df   = get_scan_mix(df, limit)
+    records  = sanitize_records(top_df.to_dict(orient="records"))
+    brain_map = get_brain_report(records)
+
+    sorted_results = sorted(brain_map.values(), key=lambda x: x["brain_score"], reverse=True)
+    return {"count": len(sorted_results), "results": sorted_results}
+
+
+@app.get("/news/{symbol}")
+def news_coin(symbol: str):
+    """Latest news and sentiment for a coin."""
+    from app.news_scanner import get_coin_news
+    data = get_coin_news(symbol.upper())
+    return {"symbol": symbol.upper(), **data}
+
+
+@app.get("/social/{symbol}")
+def social_coin(symbol: str):
+    """Reddit mentions and sentiment for a coin."""
+    from app.social_scanner import get_social_data
+    data = get_social_data(symbol.upper())
+    return {"symbol": symbol.upper(), **data}
+
+
+@app.get("/whale/{symbol}")
+def whale_coin(symbol: str):
+    """Whale and volume anomaly signals for a coin."""
+    from app.whale_tracker import get_whale_signal
+    data = get_whale_signal(symbol.upper())
+    return {"symbol": symbol.upper(), **data}
+
+
+@app.get("/trending")
+def trending_coins(min_scans: int = Query(3, ge=1), limit: int = Query(10, ge=1, le=50)):
+    """Coins that have appeared consistently across multiple scan cycles."""
+    coins = get_trending_coins(min_scans=min_scans, limit=limit)
+    return {"count": len(coins), "results": coins}
