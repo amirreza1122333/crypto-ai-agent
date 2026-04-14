@@ -54,7 +54,7 @@ DB_PATH = Path(__file__).resolve().parent.parent / "user_data.db"
 # هر چند ثانیه watchlist alert چک شود
 ALERT_POLL_SECONDS = 300
 ALERT_COOLDOWN_SECONDS = 1800
-GEM_POLL_SECONDS        = 300   # scan for new gems every 5 min
+GEM_POLL_SECONDS        = 60    # scan for new gems every 60 seconds
 GEM_COOLDOWN_SECONDS    = 3600  # don't re-alert same gem within 1 hour
 PRICE_ALERT_POLL        = 300   # check price alerts every 5 min
 BRAIN_ALERT_THRESHOLD   = 72    # brain score threshold for brain alerts
@@ -568,27 +568,46 @@ def settings_text(chat_id: int) -> str:
     )
 
 
+def _fmt_usd(v: float) -> str:
+    if v >= 1_000_000: return f"${v/1_000_000:.1f}M"
+    if v >= 1_000:     return f"${v/1_000:.0f}K"
+    return f"${v:.0f}"
+
+def _fmt_age(h: float) -> str:
+    if h < 1:    return f"{int(h*60)}m"
+    if h < 48:   return f"{h:.1f}h"
+    return f"{h/24:.1f}d"
+
+
 def format_gems(gems: list) -> str:
     if not gems:
-        return "💎 New Gem Scanner\n\nNo new gems found right now.\nTry again in a few minutes."
+        return "New Gem Scanner\n\nNo new gems found right now.\nTry again in a few minutes."
 
-    text = "💎 New Gem Scanner\n\n"
+    text = "New Gem Scanner\n\n"
     for i, g in enumerate(gems, 1):
-        age = g["age_hours"]
-        age_str = f"{age:.0f}h" if age < 48 else f"{age/24:.1f}d"
-        fdv = g["fdv"]
-        fdv_str = f"${fdv/1_000_000:.1f}M" if fdv >= 1_000_000 else f"${fdv/1_000:.0f}K"
-        vol_str = f"${g['volume_24h']/1_000:.0f}K" if g['volume_24h'] < 1_000_000 else f"${g['volume_24h']/1_000_000:.1f}M"
-        liq_str = f"${g['liquidity_usd']/1_000:.0f}K" if g['liquidity_usd'] < 1_000_000 else f"${g['liquidity_usd']/1_000_000:.1f}M"
+        tier    = g.get("tier", "dex")
+        age_str = _fmt_age(g["age_hours"])
+        mcap    = g.get("market_cap_usd") or g.get("fdv", 0)
 
-        text += (
-            f"{i}. {g['name']} ({g['symbol'].upper()}) [{g['chain'].upper()}]\n"
-            f"Price: ${g['price_usd']:.6f}\n"
-            f"24h: +{g['price_change_24h']:.1f}% | 1h: {g['price_change_1h']:+.1f}%\n"
-            f"Vol: {vol_str} | Liq: {liq_str} | FDV: {fdv_str}\n"
-            f"Age: {age_str} | Buys/Sells: {g['buys_24h']}/{g['sells_24h']}\n"
-            f"Gem Score: {g['gem_score']}/100\n"
-        )
+        if tier == "pumpfun":
+            # Pump.fun early launch format
+            koth_tag = " [KING OF HILL]" if g.get("is_koth") else ""
+            text += (
+                f"{i}. {g['name']} ({g['symbol'].upper()}) [PUMP.FUN]{koth_tag}\n"
+                f"MCap: {_fmt_usd(mcap)} | Age: {age_str}\n"
+                f"Replies: {g.get('reply_count', 0)} | Score: {g['gem_score']}/100\n"
+            )
+        else:
+            ch5m = g.get("price_change_5m", 0)
+            text += (
+                f"{i}. {g['name']} ({g['symbol'].upper()}) [{g['chain'].upper()}]\n"
+                f"Price: ${g['price_usd']:.6f}\n"
+                f"5m: {ch5m:+.1f}% | 1h: {g['price_change_1h']:+.1f}% | 24h: {g['price_change_24h']:+.1f}%\n"
+                f"Vol5m: {_fmt_usd(g.get('volume_5m',0))} | Liq: {_fmt_usd(g['liquidity_usd'])} | FDV: {_fmt_usd(g['fdv'])}\n"
+                f"Age: {age_str} | Buys/Sells: {g['buys_24h']}/{g['sells_24h']}\n"
+                f"Gem Score: {g['gem_score']}/100\n"
+            )
+
         if g.get("url"):
             text += f"Chart: {g['url']}\n"
         text += "\n"
@@ -634,7 +653,9 @@ def gem_alert_loop():
                 gems = scan_new_gems(max_results=5)
 
                 for gem in gems:
-                    if gem["gem_score"] < GEM_ALERT_SCORE:
+                    # Pump.fun early launches use a lower score threshold
+                    threshold = 40 if gem.get("tier") == "pumpfun" else GEM_ALERT_SCORE
+                    if gem["gem_score"] < threshold:
                         continue
 
                     token_key = f"{gem['token_address']}:{gem['chain']}"
@@ -643,17 +664,30 @@ def gem_alert_loop():
 
                     _mark_gem_alerted(token_key)
 
-                    age = gem["age_hours"]
-                    age_str = f"{age:.0f}h" if age < 48 else f"{age/24:.1f}d"
-                    msg = (
-                        f"💎 NEW GEM ALERT\n\n"
-                        f"{gem['name']} ({gem['symbol'].upper()}) [{gem['chain'].upper()}]\n"
-                        f"Price: ${gem['price_usd']:.6f}\n"
-                        f"24h: +{gem['price_change_24h']:.1f}%\n"
-                        f"Vol: ${gem['volume_24h']:,.0f}\n"
-                        f"Liq: ${gem['liquidity_usd']:,.0f}\n"
-                        f"Age: {age_str} | Score: {gem['gem_score']}/100\n"
-                    )
+                    age_str  = _fmt_age(gem["age_hours"])
+                    tier     = gem.get("tier", "dex")
+                    mcap     = gem.get("market_cap_usd") or gem.get("fdv", 0)
+                    koth_tag = " [KING OF HILL]" if gem.get("is_koth") else ""
+
+                    if tier == "pumpfun":
+                        msg = (
+                            f"EARLY LAUNCH ALERT{koth_tag}\n\n"
+                            f"{gem['name']} ({gem['symbol'].upper()}) on PUMP.FUN\n"
+                            f"MCap: {_fmt_usd(mcap)}\n"
+                            f"Age: {age_str} | Replies: {gem.get('reply_count', 0)}\n"
+                            f"Score: {gem['gem_score']}/100\n"
+                        )
+                    else:
+                        ch5m = gem.get("price_change_5m", 0)
+                        msg = (
+                            f"NEW GEM ALERT\n\n"
+                            f"{gem['name']} ({gem['symbol'].upper()}) [{gem['chain'].upper()}]\n"
+                            f"Price: ${gem['price_usd']:.6f}\n"
+                            f"5m: {ch5m:+.1f}% | 1h: {gem['price_change_1h']:+.1f}%\n"
+                            f"Vol5m: {_fmt_usd(gem.get('volume_5m',0))} | Liq: {_fmt_usd(gem['liquidity_usd'])}\n"
+                            f"Age: {age_str} | Score: {gem['gem_score']}/100\n"
+                        )
+
                     if gem.get("url"):
                         msg += f"Chart: {gem['url']}\n"
                     msg += "\nDYOR - high risk!"
