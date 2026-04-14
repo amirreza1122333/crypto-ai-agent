@@ -21,6 +21,7 @@ from app.whale_tracker import format_whale_text
 from app.memory_store import init_memory_table, get_trending_coins
 from app.fear_greed import format_fear_greed
 from app.funding_rates import format_funding_text
+from app.helius_enricher import enrich_gem, format_enrichment
 from app.price_alerts import (
     init_price_alerts_table, add_price_alert, format_user_alerts,
     remove_price_alert, get_all_active_alerts, mark_alert_triggered,
@@ -690,6 +691,19 @@ def gem_alert_loop():
 
                     if gem.get("url"):
                         msg += f"Chart: {gem['url']}\n"
+
+                    # Helius enrichment — adds rug risk + creator history
+                    try:
+                        enrichment = enrich_gem(
+                            gem.get("token_address", ""),
+                            gem.get("chain", "solana"),
+                        )
+                        risk_text = format_enrichment(enrichment)
+                        if risk_text:
+                            msg += f"\n{risk_text}\n"
+                    except Exception:
+                        pass
+
                     msg += "\nDYOR - high risk!"
 
                     for chat_id in gem_users:
