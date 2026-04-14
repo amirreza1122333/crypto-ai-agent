@@ -919,7 +919,7 @@ def daily_report_loop():
     time.sleep(120)  # wait for everything to start
     while True:
         try:
-            now_utc = datetime.datetime.utcnow()
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
             today   = now_utc.date()
 
             if now_utc.hour == DAILY_REPORT_HOUR_UTC and last_sent_date != today:
