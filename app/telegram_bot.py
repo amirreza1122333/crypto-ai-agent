@@ -54,7 +54,7 @@ DB_PATH = Path(__file__).resolve().parent.parent / "user_data.db"
 # هر چند ثانیه watchlist alert چک شود
 ALERT_POLL_SECONDS = 300
 ALERT_COOLDOWN_SECONDS = 1800
-GEM_POLL_SECONDS        = 60    # scan for new gems every 60 seconds
+GEM_POLL_SECONDS        = 45    # scan for new gems every 45 seconds
 GEM_COOLDOWN_SECONDS    = 3600  # don't re-alert same gem within 1 hour
 PRICE_ALERT_POLL        = 300   # check price alerts every 5 min
 BRAIN_ALERT_THRESHOLD   = 72    # brain score threshold for brain alerts
@@ -589,8 +589,8 @@ def format_gems(gems: list) -> str:
         age_str = _fmt_age(g["age_hours"])
         mcap    = g.get("market_cap_usd") or g.get("fdv", 0)
 
+        dex_label = g.get("dex") or g["chain"].upper()
         if tier == "pumpfun":
-            # Pump.fun early launch format
             koth_tag = " [KING OF HILL]" if g.get("is_koth") else ""
             text += (
                 f"{i}. {g['name']} ({g['symbol'].upper()}) [PUMP.FUN]{koth_tag}\n"
@@ -600,12 +600,11 @@ def format_gems(gems: list) -> str:
         else:
             ch5m = g.get("price_change_5m", 0)
             text += (
-                f"{i}. {g['name']} ({g['symbol'].upper()}) [{g['chain'].upper()}]\n"
+                f"{i}. {g['name']} ({g['symbol'].upper()}) [{dex_label}]\n"
                 f"Price: ${g['price_usd']:.6f}\n"
                 f"5m: {ch5m:+.1f}% | 1h: {g['price_change_1h']:+.1f}% | 24h: {g['price_change_24h']:+.1f}%\n"
                 f"Vol5m: {_fmt_usd(g.get('volume_5m',0))} | Liq: {_fmt_usd(g['liquidity_usd'])} | FDV: {_fmt_usd(g['fdv'])}\n"
-                f"Age: {age_str} | Buys/Sells: {g['buys_24h']}/{g['sells_24h']}\n"
-                f"Gem Score: {g['gem_score']}/100\n"
+                f"Age: {age_str} | Score: {g['gem_score']}/100\n"
             )
 
         if g.get("url"):
@@ -669,6 +668,7 @@ def gem_alert_loop():
                     mcap     = gem.get("market_cap_usd") or gem.get("fdv", 0)
                     koth_tag = " [KING OF HILL]" if gem.get("is_koth") else ""
 
+                    dex_label = gem.get("dex") or gem["chain"].upper()
                     if tier == "pumpfun":
                         msg = (
                             f"EARLY LAUNCH ALERT{koth_tag}\n\n"
@@ -681,7 +681,7 @@ def gem_alert_loop():
                         ch5m = gem.get("price_change_5m", 0)
                         msg = (
                             f"NEW GEM ALERT\n\n"
-                            f"{gem['name']} ({gem['symbol'].upper()}) [{gem['chain'].upper()}]\n"
+                            f"{gem['name']} ({gem['symbol'].upper()}) [{dex_label}]\n"
                             f"Price: ${gem['price_usd']:.6f}\n"
                             f"5m: {ch5m:+.1f}% | 1h: {gem['price_change_1h']:+.1f}%\n"
                             f"Vol5m: {_fmt_usd(gem.get('volume_5m',0))} | Liq: {_fmt_usd(gem['liquidity_usd'])}\n"
