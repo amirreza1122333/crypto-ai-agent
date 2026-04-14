@@ -18,8 +18,21 @@ from datetime import datetime, timezone
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 DEXSCREENER_BASE  = "https://api.dexscreener.com"
-PUMPFUN_API       = "https://frontend-api.pump.fun/coins"
-PUMPFUN_API2      = "https://frontend-api-2.pump.fun/coins"
+PUMPFUN_URLS      = [
+    "https://frontend-api.pump.fun/coins",
+    "https://frontend-api-2.pump.fun/coins",
+    "https://client-api-2.pump.fun/coins",
+]
+PUMPFUN_KOTH_URL  = "https://frontend-api.pump.fun/coins/king-of-the-hill"
+
+# Browser-like headers to bypass Cloudflare
+BROWSER_HEADERS = {
+    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept":          "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer":         "https://pump.fun/",
+    "Origin":          "https://pump.fun",
+}
 
 TARGET_CHAINS = {"solana", "ethereum", "bsc", "base", "arbitrum"}
 
@@ -68,20 +81,36 @@ def _age_hours(ts_ms) -> float:
 # TIER 1 — Pump.fun early scanner
 # ──────────────────────────────────────────────────────────────────────────
 
+def _get_pumpfun(url, params=None) -> list:
+    """GET from pump.fun with browser headers to bypass Cloudflare."""
+    for _ in range(2):
+        try:
+            r = requests.get(
+                url, params=params,
+                headers=BROWSER_HEADERS,
+                timeout=12, verify=False,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list):
+                    return data
+        except Exception:
+            pass
+        time.sleep(1)
+    return []
+
+
 def _fetch_pumpfun_new(limit: int = 50) -> list:
     params = {"limit": limit, "sort": "created_timestamp", "order": "DESC", "includeNsfw": "false"}
-    data = _get(PUMPFUN_API, params=params, timeout=10)
-    if isinstance(data, list):
-        return data
-    # Try backup URL
-    data = _get(PUMPFUN_API2, params=params, timeout=10)
-    return data if isinstance(data, list) else []
+    for url in PUMPFUN_URLS:
+        result = _get_pumpfun(url, params=params)
+        if result:
+            return result
+    return []
 
 
 def _fetch_pumpfun_koth() -> list:
-    """King of the Hill — tokens closest to graduating to Raydium."""
-    data = _get(f"{PUMPFUN_API}/king-of-the-hill", params={"limit": 10}, timeout=10)
-    return data if isinstance(data, list) else []
+    return _get_pumpfun(PUMPFUN_KOTH_URL, params={"limit": 10})
 
 
 def score_pumpfun(coin: dict, age_hours: float) -> int:
