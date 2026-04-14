@@ -27,6 +27,7 @@ from app.price_alerts import (
     remove_price_alert, get_all_active_alerts, mark_alert_triggered,
 )
 from app.portfolio import init_portfolio_table, add_holding, remove_holding, get_holdings, format_portfolio
+from app.prelaunch_tracker import init_prelaunch_tables, start_listener, register_callback, format_prelaunch_list
 
 # -----------------------------
 # Load ENV
@@ -551,7 +552,8 @@ def help_text() -> str:
         "--- Gems ---\n"
         "/newgems - scan for new gem launches\n"
         "/gems_on - enable gem alerts\n"
-        "/gems_off - disable gem alerts\n\n"
+        "/gems_off - disable gem alerts\n"
+        "/prelaunch - tokens detected BEFORE DEX listing\n\n"
         "/settings - your current settings\n"
         "/start - restart bot\n"
     )
@@ -1483,6 +1485,9 @@ def main():
                     else:
                         send_message(chat_id, "Portfolio commands:\n/port - show\n/port add BTC 0.5 95000\n/port remove BTC")
 
+                elif text == "/prelaunch":
+                    send_message(chat_id, format_prelaunch_list())
+
                 else:
                     send_message(chat_id, f"Unknown command: {text}\nType /help for all commands.")
 
@@ -1491,15 +1496,32 @@ def main():
             time.sleep(2)
 
 
+def _send_all_gem_users(msg: str):
+    """Broadcast a prelaunch alert to all users with gem alerts enabled."""
+    try:
+        users = all_users()
+        for uid, s in users.items():
+            if s.get("gems_enabled", True):
+                try:
+                    send_message(int(uid), msg)
+                    time.sleep(0.3)
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"[PRELAUNCH] broadcast error: {e}")
+
+
 if __name__ == "__main__":
     init_db()
-    for init_fn in [init_memory_table, init_price_alerts_table, init_portfolio_table]:
+    for init_fn in [init_memory_table, init_price_alerts_table, init_portfolio_table, init_prelaunch_tables]:
         try:
             init_fn()
         except Exception:
             pass
+    register_callback(_send_all_gem_users)
     threading.Thread(target=alert_loop,       daemon=True).start()
     threading.Thread(target=gem_alert_loop,   daemon=True).start()
     threading.Thread(target=price_alert_loop, daemon=True).start()
     threading.Thread(target=daily_report_loop, daemon=True).start()
+    start_listener()   # starts pump.fun WebSocket + monitor_loop threads
     main()
