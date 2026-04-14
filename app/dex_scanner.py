@@ -104,7 +104,7 @@ def _age_hours_iso(ts_str) -> float:
 
 
 def _fmt_pool_url(chain: str, pool_address: str) -> str:
-    return f"https://www.geckoterminal.com/{chain}/pools/{pool_address}"
+    return f"https://dexscreener.com/{chain}/{pool_address}"
 
 
 # ──────────────────────────────────────────────────────────────────────────
