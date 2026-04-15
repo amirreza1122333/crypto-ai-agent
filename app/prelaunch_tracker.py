@@ -17,6 +17,7 @@ Helius only used for enrichment after milestone alerts.
 """
 import asyncio
 import json
+import re
 import sqlite3
 import time
 import threading
@@ -88,10 +89,20 @@ def init_prelaunch_tables():
     )
     """)
     con.commit()
-    # Add ETA alert columns for existing DBs (safe to run multiple times)
-    for col in ["eta_2h", "eta_1h", "eta_30m"]:
+    # Add new columns safely (ALTER TABLE ignored if column exists)
+    new_cols = [
+        ("eta_2h",       "INTEGER DEFAULT 0"),
+        ("eta_1h",       "INTEGER DEFAULT 0"),
+        ("eta_30m",      "INTEGER DEFAULT 0"),
+        ("launch_score", "INTEGER DEFAULT 0"),
+        ("launch_tier",  "TEXT    DEFAULT 'COLD'"),
+        ("has_twitter",  "INTEGER DEFAULT 0"),
+        ("has_telegram", "INTEGER DEFAULT 0"),
+        ("has_website",  "INTEGER DEFAULT 0"),
+    ]
+    for col, typedef in new_cols:
         try:
-            con.execute(f"ALTER TABLE prelaunch_tokens ADD COLUMN {col} INTEGER DEFAULT 0")
+            con.execute(f"ALTER TABLE prelaunch_tokens ADD COLUMN {col} {typedef}")
             con.commit()
         except Exception:
             pass
@@ -99,17 +110,109 @@ def init_prelaunch_tables():
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Token quality scorer  (runs at creation, zero extra API calls)
+# ──────────────────────────────────────────────────────────────────────────
+
+_RANDOM_RE = re.compile(r'^[a-z0-9]{1,4}$')   # "dsf", "fds", "5", "yn"
+
+def _name_score(name: str) -> int:
+    """0-20 points for token name quality."""
+    if not name or len(name) < 2:
+        return 0
+    if _RANDOM_RE.match(name.strip().lower()):
+        return 0                          # random garbage name
+    if len(name) <= 2:
+        return 0
+    if ' ' in name:                       # multi-word = more thought
+        return 20
+    if any(c.isupper() for c in name[1:]):# has capitals = some branding
+        return 15
+    return 10
+
+
+def score_new_token(ws_msg: dict, sol_price: float = 150.0) -> tuple:
+    """
+    Score a newly created pump.fun token from WebSocket event data.
+
+    Signal weights (total 100):
+      Twitter present   → +30  (most predictive of pumps)
+      Telegram present  → +20  (community = buyers ready)
+      Website present   → +10
+      Quality name      → +20  (not random letters)
+      Has description   → +10
+      Strong initial buy→ +10
+
+    Tiers:
+      HOT  (≥55) → alert immediately
+      WARM (≥30) → monitor closely, alert at first milestone
+      COLD (<30) → batch digest only, probably dies
+    """
+    score   = 0
+    reasons = []
+
+    name        = (ws_msg.get("name")        or "").strip()
+    description = (ws_msg.get("description") or "").strip()
+    twitter     = (ws_msg.get("twitter")     or "").strip()
+    telegram    = (ws_msg.get("telegram")    or "").strip()
+    website     = (ws_msg.get("website")     or "").strip()
+    mcap_sol    = float(ws_msg.get("marketCapSol", 0) or 0)
+    mcap_usd    = mcap_sol * sol_price
+
+    # Social presence — most predictive signal
+    if twitter:
+        score += 30
+        reasons.append(f"Twitter")
+    if telegram:
+        score += 20
+        reasons.append("Telegram")
+    if website:
+        score += 10
+        reasons.append("Website")
+
+    # Metadata quality
+    nq = _name_score(name)
+    score += nq
+    if nq > 0:
+        reasons.append(f"Name: {name}")
+
+    if description and len(description) > 25:
+        score += 10
+        reasons.append("Description")
+
+    # Initial buy above bonding curve floor
+    if mcap_usd >= 6_000:
+        score += 10
+        reasons.append(f"Buy-in: {_fmt(mcap_usd)}")
+    elif mcap_usd >= 4_000:
+        score += 5
+
+    # Tier
+    if score >= 55:
+        tier = "HOT"
+    elif score >= 30:
+        tier = "WARM"
+    else:
+        tier = "COLD"
+
+    return score, reasons, tier
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # DB helpers
 # ──────────────────────────────────────────────────────────────────────────
 
-def _add(mint, name, symbol, creator, mcap_usd, sol_price):
+def _add(mint, name, symbol, creator, mcap_usd, sol_price,
+         score=0, tier="COLD", has_twitter=0, has_telegram=0, has_website=0):
     now = int(time.time())
     con = sqlite3.connect(DB_PATH)
     con.execute("""
         INSERT OR IGNORE INTO prelaunch_tokens
-        (mint, name, symbol, creator, detected_ts, last_mcap_usd, peak_mcap_usd, last_checked_ts, sol_price)
-        VALUES (?,?,?,?,?,?,?,?,?)
-    """, (mint, name, symbol, creator, now, mcap_usd, mcap_usd, now, sol_price))
+        (mint, name, symbol, creator, detected_ts, last_mcap_usd, peak_mcap_usd,
+         last_checked_ts, sol_price, launch_score, launch_tier,
+         has_twitter, has_telegram, has_website)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (mint, name, symbol, creator, now, mcap_usd, mcap_usd,
+          now, sol_price, score, tier, has_twitter, has_telegram, has_website))
     con.commit()
     con.close()
 
@@ -373,10 +476,26 @@ def _check_token(t: dict):
     elif mcap >= 5_000 and not f.get("m_10k"):
         _mark(mint, "m_10k")
         if age_min <= 60:
+            # Fetch score from DB for richer alert
+            con  = sqlite3.connect(DB_PATH)
+            cur  = con.cursor()
+            cur.execute(
+                "SELECT launch_score, launch_tier, has_twitter, has_telegram FROM prelaunch_tokens WHERE mint=?",
+                (mint,)
+            )
+            row = cur.fetchone()
+            con.close()
+            sc   = row[0] if row else 0
+            tier = row[1] if row else "?"
+            twit = "𝕏" if (row and row[2]) else ""
+            tele = "✈️" if (row and row[3]) else ""
+            soc  = " ".join(filter(None, [twit, tele])) or "—"
+
             _alert(
                 f"PRE-LAUNCH: Gaining Traction!\n\n"
                 f"{name} ({symbol.upper()})\n"
                 f"MCap: {_fmt(mcap)} | Age: {age_min}m\n"
+                f"Score: {sc}/100 [{tier}] | Socials: {soc}\n"
                 f"https://pump.fun/{mint}"
             )
 
@@ -493,29 +612,51 @@ async def _ws_listen():
                         sol = _cached_sol_price()
                         mcap_usd = mcap_sol * sol
 
-                        print(f"[PRELAUNCH] New: {name} ({symbol}) MCap ${mcap_usd:,.0f}")
-                        _add(mint, name, symbol, creator, mcap_usd, sol)
+                        # ── Score token at creation ──
+                        score, reasons, tier = score_new_token(msg, sol)
+
+                        print(
+                            f"[PRELAUNCH] New: {name} ({symbol}) "
+                            f"MCap ${mcap_usd:,.0f} | Score:{score} [{tier}]"
+                        )
+
+                        _add(mint, name, symbol, creator, mcap_usd, sol,
+                             score=score, tier=tier,
+                             has_twitter=1 if msg.get("twitter") else 0,
+                             has_telegram=1 if msg.get("telegram") else 0,
+                             has_website=1 if msg.get("website") else 0)
 
                         global _batch_buffer, _batch_last_ts
                         now = time.time()
 
-                        if mcap_usd >= INSTANT_ALERT_MCAP:
-                            # Option C — IMMEDIATE alert: strong initial buy at launch
-                            floor_pct = int((mcap_usd / GRADUATION_MCAP) * 100)
+                        if tier == "HOT":
+                            # Immediate alert — has social presence + quality name
+                            social = []
+                            if msg.get("twitter"):  social.append("𝕏 Twitter")
+                            if msg.get("telegram"): social.append("✈️ Telegram")
+                            if msg.get("website"):  social.append("🌐 Website")
+                            social_str = " | ".join(social) if social else "—"
+
                             _alert(
-                                f"HOT NEW LAUNCH!\n\n"
-                                f"{name} ({symbol.upper()}) just created on pump.fun\n"
-                                f"Initial MCap: {_fmt(mcap_usd)}\n"
-                                f"Progress: {floor_pct}% to DEX graduation\n"
-                                f"Creator: {creator[:8]}...\n\n"
+                                f"HOT NEW LAUNCH!  Score:{score}/100\n\n"
+                                f"{name} ({symbol.upper()})\n"
+                                f"MCap: {_fmt(mcap_usd)} | Just created\n"
+                                f"Socials: {social_str}\n"
+                                f"Signals: {', '.join(reasons[:4])}\n\n"
                                 f"Buy NOW (seconds old):\n"
                                 f"https://pump.fun/{mint}"
                             )
+
+                        elif tier == "WARM":
+                            # Worth watching — monitor closely, alert at first milestone
+                            # (fast monitor loop will catch it at $5K)
+                            pass
+
                         else:
-                            # Small launch — add to batch digest (every 10 min)
+                            # COLD — batch digest every 10 min
                             _batch_buffer.append({
                                 "name": name, "symbol": symbol,
-                                "mcap": mcap_usd, "mint": mint,
+                                "mcap": mcap_usd, "mint": mint, "score": score,
                             })
                             if now - _batch_last_ts >= BATCH_INTERVAL and _batch_buffer:
                                 _batch_last_ts = now
