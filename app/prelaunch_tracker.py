@@ -187,9 +187,12 @@ def score_new_token(ws_msg: dict, sol_price: float = 150.0) -> tuple:
         score += 5
 
     # Tier
-    if score >= 55:
+    #   HOT  (≥50): Twitter OR Telegram + something = likely organized launch
+    #   WARM (≥15): quality name, desc, or website = worth watching
+    #   COLD (<15): random name, nothing set = 99% dead on arrival
+    if score >= 50:
         tier = "HOT"
-    elif score >= 30:
+    elif score >= 15:
         tier = "WARM"
     else:
         tier = "COLD"
@@ -613,8 +616,10 @@ async def _ws_listen():
                         mcap_usd = mcap_sol * sol
 
                         # ── Fetch social metadata from pump.fun API ──
-                        # WebSocket event does NOT include twitter/telegram/website —
-                        # they are in the off-chain IPFS metadata. Fetch now.
+                        # WebSocket fires instantly on-chain, but pump.fun REST API
+                        # needs ~2s to index the new mint. Without this delay we get
+                        # empty socials even for organized launches with Twitter set.
+                        await asyncio.sleep(2)
                         try:
                             api_resp = await asyncio.wait_for(
                                 asyncio.to_thread(
@@ -622,10 +627,10 @@ async def _ws_listen():
                                         f"https://frontend-api.pump.fun/coins/{m}",
                                         headers={"User-Agent": "Mozilla/5.0",
                                                  "Referer": "https://pump.fun/"},
-                                        timeout=3, verify=False,
+                                        timeout=5, verify=False,
                                     )
                                 ),
-                                timeout=4,
+                                timeout=6,
                             )
                             if api_resp.status_code == 200:
                                 api_data = api_resp.json()
@@ -633,8 +638,21 @@ async def _ws_listen():
                                 msg["telegram"]    = api_data.get("telegram")    or ""
                                 msg["website"]     = api_data.get("website")     or ""
                                 msg["description"] = api_data.get("description") or ""
-                        except Exception:
-                            pass   # score without social data if API fails
+                                has_any = bool(msg["twitter"] or msg["telegram"] or msg["website"])
+                                print(
+                                    f"[PRELAUNCH] API OK: "
+                                    f"tw={bool(msg['twitter'])} "
+                                    f"tg={bool(msg['telegram'])} "
+                                    f"web={bool(msg['website'])} "
+                                    f"desc={len(msg['description'])}c"
+                                    + (" ← HAS SOCIALS" if has_any else "")
+                                )
+                            else:
+                                print(f"[PRELAUNCH] API {api_resp.status_code} for {mint[:8]}")
+                        except asyncio.TimeoutError:
+                            print(f"[PRELAUNCH] API timeout for {mint[:8]}")
+                        except Exception as ex:
+                            print(f"[PRELAUNCH] API error {mint[:8]}: {ex}")
 
                         # ── Score token at creation ──
                         score, reasons, tier = score_new_token(msg, sol)
@@ -673,7 +691,6 @@ async def _ws_listen():
 
                         elif tier == "WARM":
                             # Worth watching — fast monitor (30s) will alert at $5K
-                            # Add to WARM batch so user sees promising ones periodically
                             _batch_buffer.append({
                                 "name": name, "symbol": symbol,
                                 "mcap": mcap_usd, "mint": mint,
@@ -681,41 +698,36 @@ async def _ws_listen():
                             })
 
                         else:
-                            # COLD — track silently, no alert (99% die here)
-                            # Only add to batch if name looks real (not "dsf", "5")
-                            if _name_score(name) > 0:
-                                _batch_buffer.append({
-                                    "name": name, "symbol": symbol,
-                                    "mcap": mcap_usd, "mint": mint,
-                                    "score": score, "tier": "COLD",
-                                })
+                            # COLD — random junk name + no socials. Track silently,
+                            # never alert. These tokens die at $2-3K (99%+ of all mints).
+                            pass
 
-                        # Batch digest — send every 10 min, WARM tokens only
+                        # ── Batch digest — every 10 min, top scored WARM tokens ──
                         if now - _batch_last_ts >= BATCH_INTERVAL and _batch_buffer:
                             _batch_last_ts = now
 
-                            # Deduplicate by name (same name = copy scam, keep highest MCap)
+                            # Deduplicate by name (copy scams reuse the same name)
                             seen_names: dict = {}
                             for t in _batch_buffer:
                                 n = t["name"].lower()
-                                if n not in seen_names or t["mcap"] > seen_names[n]["mcap"]:
+                                if n not in seen_names or t["score"] > seen_names[n]["score"]:
                                     seen_names[n] = t
                             unique = list(seen_names.values())
-
-                            # Only message if there are WARM tokens worth seeing
-                            warm = [t for t in unique if t["tier"] == "WARM"]
                             _batch_buffer.clear()
 
-                            if warm:
-                                warm_sorted = sorted(warm, key=lambda x: x["score"], reverse=True)[:5]
-                                lines = [f"Promising New Launches ({len(warm_sorted)} tokens)\n"]
-                                for t in warm_sorted:
+                            # Sort by score, show top 5
+                            top = sorted(unique, key=lambda x: x["score"], reverse=True)[:5]
+                            if top:
+                                tier_icon = {"HOT": "", "WARM": "", "COLD": ""}
+                                lines = [f"New Launches — {len(top)} Promising Tokens\n"]
+                                for t in top:
+                                    icon = tier_icon.get(t["tier"], "")
                                     lines.append(
-                                        f"• {t['name']} ({t['symbol'].upper()})"
-                                        f" — {_fmt(t['mcap'])} | Score:{t['score']}\n"
+                                        f"{icon} {t['name']} ({t['symbol'].upper()})"
+                                        f" — {_fmt(t['mcap'])} | Score:{t['score']}/100\n"
                                         f"  https://pump.fun/{t['mint']}"
                                     )
-                                lines.append("\nWARN tier — no socials but quality name. DYOR.")
+                                lines.append("\nDYOR — unverified. Monitor these closely.")
                                 _alert("\n".join(lines))
 
                     except Exception as e:
