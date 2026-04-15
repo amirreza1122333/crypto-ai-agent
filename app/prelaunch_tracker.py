@@ -37,9 +37,11 @@ except ImportError:
 
 DB_PATH          = Path(__file__).resolve().parent.parent / "user_data.db"
 PUMPFUN_WS       = "wss://pumpportal.fun/api/data"
-GRADUATION_MCAP  = 65_000    # ~$69K is the graduation threshold
-TRACK_HOURS      = 6         # stop tracking after 6 hours
-MONITOR_INTERVAL = 120       # check progress every 2 minutes
+GRADUATION_MCAP       = 65_000  # ~$69K graduation threshold
+TRACK_HOURS           = 6       # stop tracking after 6 hours
+MONITOR_FRESH_SECS    = 30      # check tokens < 15 min old every 30 seconds
+MONITOR_VETERAN_SECS  = 120     # check older tokens every 2 minutes
+FRESH_TOKEN_MINUTES   = 15      # tokens under this age get priority checking
 
 _alert_callbacks: list = []  # registered Telegram send functions
 
@@ -310,116 +312,147 @@ def _fmt(v: float) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Monitoring loop
+# Monitoring loop — priority-based (fresh tokens checked every 30s)
 # ──────────────────────────────────────────────────────────────────────────
 
+def _check_token(t: dict):
+    """Check one token's MCap and fire any milestone/ETA alerts."""
+    mint   = t["mint"]
+    name   = t["name"]
+    symbol = t["symbol"]
+
+    mcap = _fetch_mcap(mint)
+    if mcap <= 0:
+        return
+
+    _update(mint, mcap)
+    f       = _flags(mint)
+    age_min = int((time.time() - t["detected_ts"]) / 60)
+    eta     = _eta_minutes(mint, mcap)
+    eta_str = f"~{eta}min to DEX" if eta > 0 else ""
+
+    # ── MCap milestones (age-filtered to avoid stale alerts) ──
+    if mcap >= GRADUATION_MCAP and not f.get("m_grad"):
+        _mark(mint, "m_grad")
+        _mark(mint, "graduated")
+        con = sqlite3.connect(DB_PATH)
+        con.execute("UPDATE prelaunch_tokens SET graduated=1 WHERE mint=?", (mint,))
+        con.commit()
+        con.close()
+        _alert(
+            f"GRADUATED TO DEX!\n\n"
+            f"{name} ({symbol.upper()}) just hit {_fmt(mcap)} MCap\n"
+            f"Now launching on Raydium!\n"
+            f"Age: {age_min}m\n"
+            f"Chart: https://dexscreener.com/solana/{mint}"
+        )
+
+    elif mcap >= 50_000 and not f.get("m_50k"):
+        _mark(mint, "m_50k")
+        if age_min <= 180:
+            _alert(
+                f"APPROACHING DEX LAUNCH!\n\n"
+                f"{name} ({symbol.upper()})\n"
+                f"MCap: {_fmt(mcap)} | Age: {age_min}m\n"
+                f"{eta_str}\n"
+                f"Close to $69K graduation!\n"
+                f"https://pump.fun/{mint}"
+            )
+
+    elif mcap >= 30_000 and not f.get("m_30k"):
+        _mark(mint, "m_30k")
+        if age_min <= 120:
+            _alert(
+                f"PRE-LAUNCH: Strong Momentum\n\n"
+                f"{name} ({symbol.upper()})\n"
+                f"MCap: {_fmt(mcap)} | Age: {age_min}m\n"
+                f"{eta_str}\n"
+                f"https://pump.fun/{mint}"
+            )
+
+    elif mcap >= 5_000 and not f.get("m_10k"):
+        _mark(mint, "m_10k")
+        if age_min <= 60:
+            _alert(
+                f"PRE-LAUNCH: Gaining Traction!\n\n"
+                f"{name} ({symbol.upper()})\n"
+                f"MCap: {_fmt(mcap)} | Age: {age_min}m\n"
+                f"https://pump.fun/{mint}"
+            )
+
+    # ── ETA countdown alerts ──
+    if eta > 0:
+        if eta <= 30 and not f.get("eta_30m"):
+            _mark(mint, "eta_30m")
+            _alert(
+                f"LAUNCHING IN ~30 MINUTES!\n\n"
+                f"{name} ({symbol.upper()})\n"
+                f"MCap: {_fmt(mcap)} | Age: {age_min}m\n"
+                f"Buy on pump.fun NOW:\n"
+                f"https://pump.fun/{mint}"
+            )
+        elif eta <= 60 and not f.get("eta_1h"):
+            _mark(mint, "eta_1h")
+            _alert(
+                f"DEX LAUNCH IN ~1 HOUR\n\n"
+                f"{name} ({symbol.upper()})\n"
+                f"MCap: {_fmt(mcap)} | ETA: ~{eta}min\n"
+                f"https://pump.fun/{mint}"
+            )
+        elif eta <= 120 and not f.get("eta_2h"):
+            _mark(mint, "eta_2h")
+            _alert(
+                f"DEX LAUNCH IN ~2 HOURS\n\n"
+                f"{name} ({symbol.upper()})\n"
+                f"MCap: {_fmt(mcap)} | ETA: ~{eta}min\n"
+                f"https://pump.fun/{mint}"
+            )
+
+
 def monitor_loop():
-    time.sleep(90)
+    """
+    Priority-based monitor:
+      - Fresh tokens (< 15 min old) → checked every 30 seconds
+      - Veteran tokens (>= 15 min)  → checked every 2 minutes max
+    This ensures we catch tokens like Conviction at $5K not $19K.
+    """
+    time.sleep(30)   # short initial wait
+
+    veteran_last_check: dict = {}   # mint → last check timestamp
+
     while True:
         try:
+            now    = time.time()
             tokens = get_active_tokens()
-            for t in tokens:
-                mint   = t["mint"]
-                name   = t["name"]
-                symbol = t["symbol"]
 
-                mcap = _fetch_mcap(mint)
-                if mcap <= 0:
+            fresh    = [t for t in tokens
+                        if (now - t["detected_ts"]) / 60 < FRESH_TOKEN_MINUTES]
+            veterans = [t for t in tokens
+                        if (now - t["detected_ts"]) / 60 >= FRESH_TOKEN_MINUTES]
+
+            # ── Fresh tokens: check every pass (every 30 s) ──
+            for t in fresh:
+                try:
+                    _check_token(t)
+                except Exception as e:
+                    print(f"[PRELAUNCH] Check error {t['mint'][:8]}: {e}")
+                time.sleep(0.3)
+
+            # ── Veterans: check only if 2+ min since last check ──
+            for t in veterans:
+                mint = t["mint"]
+                if now - veteran_last_check.get(mint, 0) >= MONITOR_VETERAN_SECS:
+                    veteran_last_check[mint] = now
+                    try:
+                        _check_token(t)
+                    except Exception as e:
+                        print(f"[PRELAUNCH] Check error {t['mint'][:8]}: {e}")
                     time.sleep(0.5)
-                    continue
-
-                _update(mint, mcap)
-                f = _flags(mint)
-
-                age_min = int((time.time() - t["detected_ts"]) / 60)
-                eta     = _eta_minutes(mint, mcap)
-                eta_str = f"~{eta}min to DEX" if eta > 0 else ""
-
-                # ── MCap milestone alerts — ONLY fire if token is fresh (<= 90 min old) ──
-                # Old stagnant tokens are silently marked to avoid spam
-                if mcap >= GRADUATION_MCAP and not f.get("m_grad"):
-                    _mark(mint, "m_grad")
-                    _mark(mint, "graduated")
-                    con = sqlite3.connect(DB_PATH)
-                    con.execute("UPDATE prelaunch_tokens SET graduated=1 WHERE mint=?", (mint,))
-                    con.commit()
-                    con.close()
-                    # Graduation alert always fires regardless of age
-                    _alert(
-                        f"GRADUATED TO DEX!\n\n"
-                        f"{name} ({symbol}) just hit {_fmt(mcap)} MCap\n"
-                        f"Now launching on Raydium!\n"
-                        f"Age: {age_min}m\n"
-                        f"Chart: https://dexscreener.com/solana/{mint}"
-                    )
-
-                elif mcap >= 50_000 and not f.get("m_50k"):
-                    _mark(mint, "m_50k")
-                    if age_min <= 180:   # only alert if < 3 hours old
-                        _alert(
-                            f"APPROACHING DEX LAUNCH!\n\n"
-                            f"{name} ({symbol})\n"
-                            f"MCap: {_fmt(mcap)} | Age: {age_min}m\n"
-                            f"{eta_str}\n"
-                            f"Close to $69K graduation threshold!\n"
-                            f"https://pump.fun/{mint}"
-                        )
-
-                elif mcap >= 30_000 and not f.get("m_30k"):
-                    _mark(mint, "m_30k")
-                    if age_min <= 120:   # only alert if < 2 hours old
-                        _alert(
-                            f"PRE-LAUNCH: Strong Momentum\n\n"
-                            f"{name} ({symbol})\n"
-                            f"MCap: {_fmt(mcap)} | Age: {age_min}m\n"
-                            f"{eta_str}\n"
-                            f"https://pump.fun/{mint}"
-                        )
-
-                elif mcap >= 5_000 and not f.get("m_10k"):
-                    _mark(mint, "m_10k")
-                    if age_min <= 60:    # only alert if < 1 hour old — fresh token!
-                        _alert(
-                            f"PRE-LAUNCH: Gaining Traction!\n\n"
-                            f"{name} ({symbol})\n"
-                            f"MCap: {_fmt(mcap)} | Age: {age_min}m\n"
-                            f"https://pump.fun/{mint}"
-                        )
-
-                # ── ETA-based countdown alerts (independent of MCap milestones) ──
-                if eta > 0:
-                    if eta <= 30 and not f.get("eta_30m"):
-                        _mark(mint, "eta_30m")
-                        _alert(
-                            f"LAUNCHING IN ~30 MINUTES!\n\n"
-                            f"{name} ({symbol.upper()})\n"
-                            f"MCap: {_fmt(mcap)} | Age: {age_min}m\n"
-                            f"Buy on pump.fun NOW before DEX listing:\n"
-                            f"https://pump.fun/{mint}"
-                        )
-                    elif eta <= 60 and not f.get("eta_1h"):
-                        _mark(mint, "eta_1h")
-                        _alert(
-                            f"DEX LAUNCH IN ~1 HOUR\n\n"
-                            f"{name} ({symbol.upper()})\n"
-                            f"MCap: {_fmt(mcap)} | ETA: ~{eta}min\n"
-                            f"https://pump.fun/{mint}"
-                        )
-                    elif eta <= 120 and not f.get("eta_2h"):
-                        _mark(mint, "eta_2h")
-                        _alert(
-                            f"DEX LAUNCH IN ~2 HOURS\n\n"
-                            f"{name} ({symbol.upper()})\n"
-                            f"MCap: {_fmt(mcap)} | ETA: ~{eta}min\n"
-                            f"https://pump.fun/{mint}"
-                        )
-
-                time.sleep(0.5)
 
         except Exception as e:
             print(f"[PRELAUNCH] Monitor error: {e}")
 
-        time.sleep(MONITOR_INTERVAL)
+        time.sleep(MONITOR_FRESH_SECS)   # 30 second main loop
 
 
 # ──────────────────────────────────────────────────────────────────────────
