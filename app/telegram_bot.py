@@ -27,7 +27,10 @@ from app.price_alerts import (
     remove_price_alert, get_all_active_alerts, mark_alert_triggered,
 )
 from app.portfolio import init_portfolio_table, add_holding, remove_holding, get_holdings, format_portfolio
-from app.prelaunch_tracker import init_prelaunch_tables, start_listener, register_callback, format_prelaunch_list
+from app.prelaunch_tracker import (
+    init_prelaunch_tables, start_listener, register_callback,
+    format_prelaunch_list, format_upcoming,
+)
 
 # -----------------------------
 # Load ENV
@@ -553,7 +556,8 @@ def help_text() -> str:
         "/newgems - scan for new gem launches\n"
         "/gems_on - enable gem alerts\n"
         "/gems_off - disable gem alerts\n"
-        "/prelaunch - tokens detected BEFORE DEX listing\n\n"
+        "/prelaunch - tokens detected BEFORE DEX listing\n"
+        "/upcoming - tokens likely to launch on DEX soon (with ETA)\n\n"
         "/settings - your current settings\n"
         "/start - restart bot\n"
     )
@@ -1487,6 +1491,10 @@ def main():
 
                 elif text == "/prelaunch":
                     send_message(chat_id, format_prelaunch_list())
+
+                elif text == "/upcoming":
+                    send_message(chat_id, "Scanning tokens approaching DEX launch...")
+                    send_message(chat_id, format_upcoming())
 
                 else:
                     send_message(chat_id, f"Unknown command: {text}\nType /help for all commands.")

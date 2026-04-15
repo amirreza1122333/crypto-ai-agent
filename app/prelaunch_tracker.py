@@ -82,6 +82,13 @@ def init_prelaunch_tables():
     )
     """)
     con.commit()
+    # Add ETA alert columns for existing DBs (safe to run multiple times)
+    for col in ["eta_2h", "eta_1h", "eta_30m"]:
+        try:
+            con.execute(f"ALTER TABLE prelaunch_tokens ADD COLUMN {col} INTEGER DEFAULT 0")
+            con.commit()
+        except Exception:
+            pass
     con.close()
 
 
@@ -128,11 +135,20 @@ def _mark(mint, col):
 def _flags(mint) -> dict:
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
-    cur.execute("SELECT m_10k, m_30k, m_50k, m_grad FROM prelaunch_tokens WHERE mint=?", (mint,))
+    cur.execute("""
+        SELECT m_10k, m_30k, m_50k, m_grad,
+               COALESCE(eta_2h,0), COALESCE(eta_1h,0), COALESCE(eta_30m,0)
+        FROM prelaunch_tokens WHERE mint=?
+    """, (mint,))
     row = cur.fetchone()
     con.close()
-    return {"m_10k": bool(row[0]), "m_30k": bool(row[1]),
-            "m_50k": bool(row[2]), "m_grad": bool(row[3])} if row else {}
+    if not row:
+        return {}
+    return {
+        "m_10k":   bool(row[0]), "m_30k": bool(row[1]),
+        "m_50k":   bool(row[2]), "m_grad": bool(row[3]),
+        "eta_2h":  bool(row[4]), "eta_1h": bool(row[5]), "eta_30m": bool(row[6]),
+    }
 
 
 def get_active_tokens() -> list:
@@ -360,6 +376,34 @@ def monitor_loop():
                         f"https://pump.fun/{mint}"
                     )
 
+                # ── ETA-based countdown alerts (independent of MCap milestones) ──
+                if eta > 0:
+                    if eta <= 30 and not f.get("eta_30m"):
+                        _mark(mint, "eta_30m")
+                        _alert(
+                            f"LAUNCHING IN ~30 MINUTES!\n\n"
+                            f"{name} ({symbol.upper()})\n"
+                            f"MCap: {_fmt(mcap)} | Age: {age_min}m\n"
+                            f"Buy on pump.fun NOW before DEX listing:\n"
+                            f"https://pump.fun/{mint}"
+                        )
+                    elif eta <= 60 and not f.get("eta_1h"):
+                        _mark(mint, "eta_1h")
+                        _alert(
+                            f"DEX LAUNCH IN ~1 HOUR\n\n"
+                            f"{name} ({symbol.upper()})\n"
+                            f"MCap: {_fmt(mcap)} | ETA: ~{eta}min\n"
+                            f"https://pump.fun/{mint}"
+                        )
+                    elif eta <= 120 and not f.get("eta_2h"):
+                        _mark(mint, "eta_2h")
+                        _alert(
+                            f"DEX LAUNCH IN ~2 HOURS\n\n"
+                            f"{name} ({symbol.upper()})\n"
+                            f"MCap: {_fmt(mcap)} | ETA: ~{eta}min\n"
+                            f"https://pump.fun/{mint}"
+                        )
+
                 time.sleep(0.5)
 
         except Exception as e:
@@ -456,6 +500,103 @@ def start_listener():
     threading.Thread(target=_run, daemon=True).start()
     threading.Thread(target=monitor_loop, daemon=True).start()
     print("[PRELAUNCH] Tracker started")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Approaching-graduation helpers
+# ──────────────────────────────────────────────────────────────────────────
+
+def get_approaching_tokens(max_eta_hours: float = 6) -> list:
+    """
+    Returns tokens on the bonding curve that have positive velocity
+    and an ETA to graduation within max_eta_hours.
+    Sorted by closest ETA first.
+    """
+    tokens = get_active_tokens()
+    result = []
+
+    for t in tokens:
+        mcap = t["last_mcap_usd"]
+        if mcap < 4_000:       # too early, no real activity yet
+            continue
+        if mcap >= GRADUATION_MCAP:
+            continue           # already graduated
+
+        eta = _eta_minutes(t["mint"], mcap)
+        if eta <= 0:
+            continue           # flat or declining — no positive velocity
+        if eta > max_eta_hours * 60:
+            continue           # too far out
+
+        # Calculate velocity from history for display
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+        cutoff = int(time.time()) - 3600
+        cur.execute(
+            "SELECT mcap, ts FROM prelaunch_history WHERE mint=? AND ts>? ORDER BY ts ASC",
+            (t["mint"], cutoff)
+        )
+        rows = cur.fetchall()
+        con.close()
+
+        if len(rows) >= 2:
+            elapsed = max(rows[-1][1] - rows[0][1], 1) / 60
+            velocity = (rows[-1][0] - rows[0][0]) / elapsed  # USD/min
+        else:
+            velocity = 0
+
+        if velocity <= 0:
+            continue
+
+        result.append({
+            **t,
+            "eta_minutes":    eta,
+            "velocity_usd_m": velocity,
+            "progress_pct":   min(mcap / GRADUATION_MCAP * 100, 100),
+        })
+
+    result.sort(key=lambda x: x["eta_minutes"])
+    return result
+
+
+def format_upcoming() -> str:
+    """Format the /upcoming command — tokens actively approaching DEX launch."""
+    tokens = get_approaching_tokens(max_eta_hours=6)
+
+    if not tokens:
+        return (
+            "Upcoming DEX Launches\n\n"
+            "No tokens detected approaching graduation right now.\n\n"
+            "Tokens appear here when they show strong buying momentum "
+            "on the pump.fun bonding curve.\n"
+            "Target: ~$69K MCap to graduate to Raydium DEX."
+        )
+
+    lines = [f"Upcoming DEX Launches — {len(tokens)} approaching\n"]
+
+    for t in tokens[:8]:
+        eta = t["eta_minutes"]
+        if eta < 60:
+            eta_str = f"~{eta}min"
+        elif eta < 120:
+            eta_str = f"~1h {eta % 60}m"
+        else:
+            eta_str = f"~{eta // 60}h {eta % 60}m"
+
+        pct = t["progress_pct"]
+        filled = int(pct / 10)
+        bar = "#" * filled + "-" * (10 - filled)
+        age_min = int((time.time() - t["detected_ts"]) / 60)
+
+        lines.append(
+            f"{t['name']} ({t['symbol'].upper()})\n"
+            f"  MCap: {_fmt(t['last_mcap_usd'])} | ETA: {eta_str} | Age: {age_min}m\n"
+            f"  [{bar}] {pct:.0f}% to DEX\n"
+            f"  Buy: https://pump.fun/{t['mint']}\n"
+        )
+
+    lines.append("Buy on pump.fun BEFORE DEX listing for the best entry!")
+    return "\n".join(lines)
 
 
 # ──────────────────────────────────────────────────────────────────────────
