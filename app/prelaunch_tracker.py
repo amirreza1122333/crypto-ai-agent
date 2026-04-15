@@ -43,10 +43,14 @@ MONITOR_INTERVAL = 120       # check progress every 2 minutes
 
 _alert_callbacks: list = []  # registered Telegram send functions
 
-# Batch buffer for WebSocket new-token alerts (rate-limited to 1 per 2 min)
+# Option C: immediate alert threshold — tokens starting above this MCap
+# already had a strong initial buy at creation (above bonding curve floor)
+INSTANT_ALERT_MCAP = 5_000   # $5K+ initial MCap = someone bought in heavily
+
+# Batch digest for everything below threshold (max 1 per 10 min, top 5 by mcap)
 _batch_buffer:  list  = []
 _batch_last_ts: float = 0.0
-BATCH_INTERVAL = 120   # seconds between batch digests
+BATCH_INTERVAL = 600   # 10 minutes between batch digests (was 2 min)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -459,31 +463,39 @@ async def _ws_listen():
                         print(f"[PRELAUNCH] New: {name} ({symbol}) MCap ${mcap_usd:,.0f}")
                         _add(mint, name, symbol, creator, mcap_usd, sol)
 
-                        # Batch buffer — collect new tokens and alert every 2 min
                         global _batch_buffer, _batch_last_ts
-                        _batch_buffer.append({
-                            "name": name, "symbol": symbol,
-                            "mcap": mcap_usd, "mint": mint,
-                        })
-
                         now = time.time()
-                        if now - _batch_last_ts >= BATCH_INTERVAL and _batch_buffer:
-                            _batch_last_ts = now
-                            # Sort by highest initial mcap, show top 5
-                            batch = sorted(
-                                _batch_buffer, key=lambda x: x["mcap"], reverse=True
-                            )[:5]
-                            _batch_buffer.clear()
 
-                            lines = [f"NEW PUMP.FUN LAUNCHES ({len(batch)} tokens)\n"]
-                            for t in batch:
-                                lines.append(
-                                    f"• {t['name']} ({t['symbol'].upper()})\n"
-                                    f"  MCap: {_fmt(t['mcap'])}\n"
-                                    f"  https://pump.fun/{t['mint']}"
-                                )
-                            lines.append("\nMonitoring for DEX graduation...")
-                            _alert("\n".join(lines))
+                        if mcap_usd >= INSTANT_ALERT_MCAP:
+                            # Option C — IMMEDIATE alert: strong initial buy at launch
+                            _alert(
+                                f"HOT NEW LAUNCH!\n\n"
+                                f"{name} ({symbol.upper()}) on pump.fun\n"
+                                f"Initial MCap: {_fmt(mcap_usd)} — strong buy-in!\n"
+                                f"Age: just created\n"
+                                f"Buy: https://pump.fun/{mint}"
+                            )
+                        else:
+                            # Small launch — add to batch digest (every 10 min)
+                            _batch_buffer.append({
+                                "name": name, "symbol": symbol,
+                                "mcap": mcap_usd, "mint": mint,
+                            })
+                            if now - _batch_last_ts >= BATCH_INTERVAL and _batch_buffer:
+                                _batch_last_ts = now
+                                batch = sorted(
+                                    _batch_buffer, key=lambda x: x["mcap"], reverse=True
+                                )[:5]
+                                _batch_buffer.clear()
+                                lines = [f"New pump.fun launches ({len(batch)} tokens)\n"]
+                                for t in batch:
+                                    lines.append(
+                                        f"• {t['name']} ({t['symbol'].upper()})"
+                                        f" — {_fmt(t['mcap'])}\n"
+                                        f"  https://pump.fun/{t['mint']}"
+                                    )
+                                lines.append("\nTracking for DEX graduation...")
+                                _alert("\n".join(lines))
 
                     except Exception as e:
                         print(f"[PRELAUNCH] Parse error: {e}")
