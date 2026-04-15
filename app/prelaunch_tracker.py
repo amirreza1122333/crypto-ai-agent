@@ -43,6 +43,11 @@ MONITOR_INTERVAL = 120       # check progress every 2 minutes
 
 _alert_callbacks: list = []  # registered Telegram send functions
 
+# Batch buffer for WebSocket new-token alerts (rate-limited to 1 per 2 min)
+_batch_buffer:  list  = []
+_batch_last_ts: float = 0.0
+BATCH_INTERVAL = 120   # seconds between batch digests
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # DB setup
@@ -346,10 +351,10 @@ def monitor_loop():
                         f"https://pump.fun/{mint}"
                     )
 
-                elif mcap >= 10_000 and not f.get("m_10k"):
+                elif mcap >= 5_000 and not f.get("m_10k"):
                     _mark(mint, "m_10k")
                     _alert(
-                        f"PRE-LAUNCH: Gaining Traction\n\n"
+                        f"PRE-LAUNCH: Gaining Traction!\n\n"
                         f"{name} ({symbol})\n"
                         f"MCap: {_fmt(mcap)} | Age: {age_min}m\n"
                         f"https://pump.fun/{mint}"
@@ -403,6 +408,32 @@ async def _ws_listen():
 
                         print(f"[PRELAUNCH] New: {name} ({symbol}) MCap ${mcap_usd:,.0f}")
                         _add(mint, name, symbol, creator, mcap_usd, sol)
+
+                        # Batch buffer — collect new tokens and alert every 2 min
+                        global _batch_buffer, _batch_last_ts
+                        _batch_buffer.append({
+                            "name": name, "symbol": symbol,
+                            "mcap": mcap_usd, "mint": mint,
+                        })
+
+                        now = time.time()
+                        if now - _batch_last_ts >= BATCH_INTERVAL and _batch_buffer:
+                            _batch_last_ts = now
+                            # Sort by highest initial mcap, show top 5
+                            batch = sorted(
+                                _batch_buffer, key=lambda x: x["mcap"], reverse=True
+                            )[:5]
+                            _batch_buffer.clear()
+
+                            lines = [f"NEW PUMP.FUN LAUNCHES ({len(batch)} tokens)\n"]
+                            for t in batch:
+                                lines.append(
+                                    f"• {t['name']} ({t['symbol'].upper()})\n"
+                                    f"  MCap: {_fmt(t['mcap'])}\n"
+                                    f"  https://pump.fun/{t['mint']}"
+                                )
+                            lines.append("\nMonitoring for DEX graduation...")
+                            _alert("\n".join(lines))
 
                     except Exception as e:
                         print(f"[PRELAUNCH] Parse error: {e}")
