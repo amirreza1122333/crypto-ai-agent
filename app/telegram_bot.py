@@ -29,7 +29,7 @@ from app.price_alerts import (
 from app.portfolio import init_portfolio_table, add_holding, remove_holding, get_holdings, format_portfolio
 from app.prelaunch_tracker import (
     init_prelaunch_tables, start_listener, register_callback,
-    format_prelaunch_list, format_upcoming,
+    format_prelaunch_list, format_upcoming, format_preorder_list,
 )
 
 # -----------------------------
@@ -556,8 +556,9 @@ def help_text() -> str:
         "/newgems - scan for new gem launches\n"
         "/gems_on - enable gem alerts\n"
         "/gems_off - disable gem alerts\n"
-        "/prelaunch - tokens detected BEFORE DEX listing\n"
-        "/upcoming - tokens likely to launch on DEX soon (with ETA)\n\n"
+        "/preorder - HOT fresh tokens < 2h old, growing fast\n"
+        "/upcoming - tokens approaching DEX graduation (with ETA)\n"
+        "/prelaunch - all detected pre-launch tokens (last 6h)\n\n"
         "/settings - your current settings\n"
         "/start - restart bot\n"
     )
@@ -1495,6 +1496,10 @@ def main():
                 elif text == "/upcoming":
                     send_message(chat_id, "Scanning tokens approaching DEX launch...")
                     send_message(chat_id, format_upcoming())
+
+                elif text == "/preorder":
+                    send_message(chat_id, "Scanning hot pre-launch tokens...")
+                    send_message(chat_id, format_preorder_list())
 
                 else:
                     send_message(chat_id, f"Unknown command: {text}\nType /help for all commands.")

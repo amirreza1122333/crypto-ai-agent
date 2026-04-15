@@ -331,6 +331,8 @@ def monitor_loop():
                 eta     = _eta_minutes(mint, mcap)
                 eta_str = f"~{eta}min to DEX" if eta > 0 else ""
 
+                # ── MCap milestone alerts — ONLY fire if token is fresh (<= 90 min old) ──
+                # Old stagnant tokens are silently marked to avoid spam
                 if mcap >= GRADUATION_MCAP and not f.get("m_grad"):
                     _mark(mint, "m_grad")
                     _mark(mint, "graduated")
@@ -338,6 +340,7 @@ def monitor_loop():
                     con.execute("UPDATE prelaunch_tokens SET graduated=1 WHERE mint=?", (mint,))
                     con.commit()
                     con.close()
+                    # Graduation alert always fires regardless of age
                     _alert(
                         f"GRADUATED TO DEX!\n\n"
                         f"{name} ({symbol}) just hit {_fmt(mcap)} MCap\n"
@@ -348,33 +351,36 @@ def monitor_loop():
 
                 elif mcap >= 50_000 and not f.get("m_50k"):
                     _mark(mint, "m_50k")
-                    _alert(
-                        f"APPROACHING DEX LAUNCH!\n\n"
-                        f"{name} ({symbol})\n"
-                        f"MCap: {_fmt(mcap)} | Age: {age_min}m\n"
-                        f"{eta_str}\n"
-                        f"Close to $69K graduation threshold!\n"
-                        f"https://pump.fun/{mint}"
-                    )
+                    if age_min <= 180:   # only alert if < 3 hours old
+                        _alert(
+                            f"APPROACHING DEX LAUNCH!\n\n"
+                            f"{name} ({symbol})\n"
+                            f"MCap: {_fmt(mcap)} | Age: {age_min}m\n"
+                            f"{eta_str}\n"
+                            f"Close to $69K graduation threshold!\n"
+                            f"https://pump.fun/{mint}"
+                        )
 
                 elif mcap >= 30_000 and not f.get("m_30k"):
                     _mark(mint, "m_30k")
-                    _alert(
-                        f"PRE-LAUNCH: Strong Momentum\n\n"
-                        f"{name} ({symbol})\n"
-                        f"MCap: {_fmt(mcap)} | Age: {age_min}m\n"
-                        f"{eta_str}\n"
-                        f"https://pump.fun/{mint}"
-                    )
+                    if age_min <= 120:   # only alert if < 2 hours old
+                        _alert(
+                            f"PRE-LAUNCH: Strong Momentum\n\n"
+                            f"{name} ({symbol})\n"
+                            f"MCap: {_fmt(mcap)} | Age: {age_min}m\n"
+                            f"{eta_str}\n"
+                            f"https://pump.fun/{mint}"
+                        )
 
                 elif mcap >= 5_000 and not f.get("m_10k"):
                     _mark(mint, "m_10k")
-                    _alert(
-                        f"PRE-LAUNCH: Gaining Traction!\n\n"
-                        f"{name} ({symbol})\n"
-                        f"MCap: {_fmt(mcap)} | Age: {age_min}m\n"
-                        f"https://pump.fun/{mint}"
-                    )
+                    if age_min <= 60:    # only alert if < 1 hour old — fresh token!
+                        _alert(
+                            f"PRE-LAUNCH: Gaining Traction!\n\n"
+                            f"{name} ({symbol})\n"
+                            f"MCap: {_fmt(mcap)} | Age: {age_min}m\n"
+                            f"https://pump.fun/{mint}"
+                        )
 
                 # ── ETA-based countdown alerts (independent of MCap milestones) ──
                 if eta > 0:
@@ -505,6 +511,97 @@ def start_listener():
 # ──────────────────────────────────────────────────────────────────────────
 # Approaching-graduation helpers
 # ──────────────────────────────────────────────────────────────────────────
+
+def get_hot_preorders(max_age_minutes: int = 120, min_velocity: float = 40) -> list:
+    """
+    AI-curated pre-order list: tokens that are FRESH (< 2h old) AND
+    growing fast enough (velocity >= $40/min) to be worth watching.
+    Sorted by velocity — fastest pump first.
+    """
+    tokens = get_active_tokens()
+    result = []
+    now = time.time()
+
+    for t in tokens:
+        age_min = int((now - t["detected_ts"]) / 60)
+        if age_min > max_age_minutes:
+            continue          # too old — skip stagnant tokens
+
+        mcap = t["last_mcap_usd"]
+        if mcap < 3_000 or mcap >= GRADUATION_MCAP:
+            continue
+
+        # Need at least 2 history points to measure velocity
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+        cur.execute(
+            "SELECT mcap, ts FROM prelaunch_history WHERE mint=? ORDER BY ts ASC",
+            (t["mint"],)
+        )
+        rows = cur.fetchall()
+        con.close()
+
+        if len(rows) < 2:
+            continue
+
+        elapsed_min = max((rows[-1][1] - rows[0][1]) / 60, 1)
+        velocity    = (rows[-1][0] - rows[0][0]) / elapsed_min   # USD per minute
+
+        if velocity < min_velocity:
+            continue          # not growing fast enough
+
+        eta = _eta_minutes(t["mint"], mcap)
+        pct = min(mcap / GRADUATION_MCAP * 100, 100)
+
+        result.append({
+            **t,
+            "age_min":        age_min,
+            "velocity_usd_m": velocity,
+            "eta_minutes":    eta if eta > 0 else -1,
+            "progress_pct":   pct,
+        })
+
+    # Fastest growing first
+    result.sort(key=lambda x: x["velocity_usd_m"], reverse=True)
+    return result
+
+
+def format_preorder_list() -> str:
+    """Format the /preorder command — fresh, fast-moving pre-launch tokens."""
+    tokens = get_hot_preorders(max_age_minutes=120, min_velocity=40)
+
+    if not tokens:
+        return (
+            "Pre-Order List — Hot New Launches\n\n"
+            "No hot pre-launch tokens right now.\n\n"
+            "This list shows tokens that are:\n"
+            "  - Less than 2 hours old\n"
+            "  - Growing fast on the bonding curve\n"
+            "  - Not yet listed on DEX\n\n"
+            "Check back in a few minutes."
+        )
+
+    lines = [f"Pre-Order List — {len(tokens)} Hot Launch{'es' if len(tokens) > 1 else ''}\n"]
+
+    for i, t in enumerate(tokens[:8], 1):
+        eta = t["eta_minutes"]
+        eta_str = f"~{eta}min to DEX" if eta > 0 else "ETA unknown"
+        pct  = t["progress_pct"]
+        filled = int(pct / 10)
+        bar  = "#" * filled + "-" * (10 - filled)
+        vel  = t["velocity_usd_m"]
+
+        lines.append(
+            f"{i}. {t['name']} ({t['symbol'].upper()})\n"
+            f"   MCap: {_fmt(t['last_mcap_usd'])} | Age: {t['age_min']}m\n"
+            f"   Speed: +${vel:.0f}/min | {eta_str}\n"
+            f"   [{bar}] {pct:.0f}% to DEX\n"
+            f"   Buy: https://pump.fun/{t['mint']}\n"
+        )
+
+    lines.append("DYOR — buy on pump.fun BEFORE DEX listing!")
+    return "\n".join(lines)
+
 
 def get_approaching_tokens(max_eta_hours: float = 6) -> list:
     """
