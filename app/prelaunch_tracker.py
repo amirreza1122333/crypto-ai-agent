@@ -600,17 +600,41 @@ async def _ws_listen():
                         if msg.get("txType") != "create":
                             continue
 
-                        mint    = msg.get("mint", "")
-                        name    = msg.get("name", "Unknown")
-                        symbol  = msg.get("symbol", "?")
-                        creator = msg.get("traderPublicKey", "")
+                        mint     = msg.get("mint", "")
+                        name     = msg.get("name", "Unknown")
+                        symbol   = msg.get("symbol", "?")
+                        creator  = msg.get("traderPublicKey", "")
                         mcap_sol = float(msg.get("marketCapSol", 0) or 0)
 
                         if not mint:
                             continue
 
-                        sol = _cached_sol_price()
+                        sol      = _cached_sol_price()
                         mcap_usd = mcap_sol * sol
+
+                        # ── Fetch social metadata from pump.fun API ──
+                        # WebSocket event does NOT include twitter/telegram/website —
+                        # they are in the off-chain IPFS metadata. Fetch now.
+                        try:
+                            api_resp = await asyncio.wait_for(
+                                asyncio.to_thread(
+                                    lambda m=mint: requests.get(
+                                        f"https://frontend-api.pump.fun/coins/{m}",
+                                        headers={"User-Agent": "Mozilla/5.0",
+                                                 "Referer": "https://pump.fun/"},
+                                        timeout=3, verify=False,
+                                    )
+                                ),
+                                timeout=4,
+                            )
+                            if api_resp.status_code == 200:
+                                api_data = api_resp.json()
+                                msg["twitter"]     = api_data.get("twitter")     or ""
+                                msg["telegram"]    = api_data.get("telegram")    or ""
+                                msg["website"]     = api_data.get("website")     or ""
+                                msg["description"] = api_data.get("description") or ""
+                        except Exception:
+                            pass   # score without social data if API fails
 
                         # ── Score token at creation ──
                         score, reasons, tier = score_new_token(msg, sol)
