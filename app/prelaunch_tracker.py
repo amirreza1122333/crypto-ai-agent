@@ -45,7 +45,7 @@ _alert_callbacks: list = []  # registered Telegram send functions
 
 # Option C: immediate alert threshold — tokens starting above this MCap
 # already had a strong initial buy at creation (above bonding curve floor)
-INSTANT_ALERT_MCAP = 5_000   # $5K+ initial MCap = someone bought in heavily
+INSTANT_ALERT_MCAP = 3_500   # $3.5K+ initial MCap = above bonding curve floor
 
 # Batch digest for everything below threshold (max 1 per 10 min, top 5 by mcap)
 _batch_buffer:  list  = []
@@ -468,12 +468,15 @@ async def _ws_listen():
 
                         if mcap_usd >= INSTANT_ALERT_MCAP:
                             # Option C — IMMEDIATE alert: strong initial buy at launch
+                            floor_pct = int((mcap_usd / GRADUATION_MCAP) * 100)
                             _alert(
                                 f"HOT NEW LAUNCH!\n\n"
-                                f"{name} ({symbol.upper()}) on pump.fun\n"
-                                f"Initial MCap: {_fmt(mcap_usd)} — strong buy-in!\n"
-                                f"Age: just created\n"
-                                f"Buy: https://pump.fun/{mint}"
+                                f"{name} ({symbol.upper()}) just created on pump.fun\n"
+                                f"Initial MCap: {_fmt(mcap_usd)}\n"
+                                f"Progress: {floor_pct}% to DEX graduation\n"
+                                f"Creator: {creator[:8]}...\n\n"
+                                f"Buy NOW (seconds old):\n"
+                                f"https://pump.fun/{mint}"
                             )
                         else:
                             # Small launch — add to batch digest (every 10 min)
