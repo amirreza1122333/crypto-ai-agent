@@ -36,6 +36,23 @@ except ImportError:
     WS_AVAILABLE = False
     print("[PRELAUNCH] websockets not installed — run: pip install websockets>=12.0")
 
+# These imports are intentionally isolated — each module is self-contained
+# and the whole pipeline degrades gracefully when any of them is missing
+# (e.g. Helius key not configured → sniper detector returns UNKNOWN).
+from app.creator_reputation import (
+    init_creator_reputation_table,
+    get_creator_stats,
+    recompute_creator,
+    recompute_all_creators,
+    top_creators,
+)
+from app.sniper_detector import (
+    init_sniper_table,
+    check_sniper_concentration,
+    format_sniper_line,
+)
+from app.live_scorer import adjust_tier as ml_adjust_tier, model_is_available
+
 DB_PATH          = Path(__file__).resolve().parent.parent / "user_data.db"
 PUMPFUN_WS       = "wss://pumpportal.fun/api/data"
 GRADUATION_MCAP       = 65_000  # ~$69K graduation threshold
@@ -55,6 +72,16 @@ _batch_buffer:  list  = []
 _batch_last_ts: float = 0.0
 BATCH_INTERVAL = 600   # 10 minutes between batch digests (was 2 min)
 
+# Outcome-logging horizons (minutes). For every detected token we record:
+#   +1h  → did it 2x quickly?  (early-pump classifier label)
+#   +6h  → did it graduate?    (bonding-curve completion label)
+#   +24h → what was the peak?  (full lifecycle label)
+# These power the future ML training set. DO NOT change the list lightly —
+# historical rows are keyed by (mint, horizon_min).
+OUTCOME_HORIZONS_MIN = [60, 360, 1440]
+OUTCOME_POLL_INTERVAL = 300      # poll every 5 minutes
+OUTCOME_LOOKBACK_HOURS = 48      # only consider tokens detected in last 48h
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # DB setup
@@ -73,7 +100,7 @@ def init_prelaunch_tables():
         peak_mcap_usd   REAL    DEFAULT 0,
         last_checked_ts INTEGER DEFAULT 0,
         graduated       INTEGER DEFAULT 0,
-        m_10k           INTEGER DEFAULT 0,
+        m_5k            INTEGER DEFAULT 0,
         m_30k           INTEGER DEFAULT 0,
         m_50k           INTEGER DEFAULT 0,
         m_grad          INTEGER DEFAULT 0,
@@ -88,17 +115,50 @@ def init_prelaunch_tables():
         ts   INTEGER
     )
     """)
+    # Outcome snapshots — the foundation of the future ML training set.
+    # One row per (mint, horizon_min). Populated by outcome_poll_loop()
+    # when a token's age crosses a horizon boundary.
+    #
+    # Columns:
+    #   horizon_min        60 / 360 / 1440 — the target age we're measuring at
+    #   snapshot_ts        when we actually recorded it (may lag horizon slightly)
+    #   mcap_at_snapshot   MCap USD at snapshot time
+    #   peak_mcap_so_far   highest MCap observed between detection and horizon
+    #   graduated_by_then  did the token reach DEX by this horizon?
+    #   return_pct         (peak_mcap_so_far - initial_mcap_usd) / initial_mcap_usd * 100
+    con.execute("""
+    CREATE TABLE IF NOT EXISTS prelaunch_outcomes (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        mint              TEXT NOT NULL,
+        horizon_min       INTEGER NOT NULL,
+        snapshot_ts       INTEGER NOT NULL,
+        mcap_at_snapshot  REAL,
+        peak_mcap_so_far  REAL,
+        graduated_by_then INTEGER DEFAULT 0,
+        return_pct        REAL,
+        UNIQUE(mint, horizon_min)
+    )
+    """)
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_outcomes_mint ON prelaunch_outcomes(mint)"
+    )
     con.commit()
     # Add new columns safely (ALTER TABLE ignored if column exists)
     new_cols = [
-        ("eta_2h",       "INTEGER DEFAULT 0"),
-        ("eta_1h",       "INTEGER DEFAULT 0"),
-        ("eta_30m",      "INTEGER DEFAULT 0"),
-        ("launch_score", "INTEGER DEFAULT 0"),
-        ("launch_tier",  "TEXT    DEFAULT 'COLD'"),
-        ("has_twitter",  "INTEGER DEFAULT 0"),
-        ("has_telegram", "INTEGER DEFAULT 0"),
-        ("has_website",  "INTEGER DEFAULT 0"),
+        ("eta_2h",           "INTEGER DEFAULT 0"),
+        ("eta_1h",           "INTEGER DEFAULT 0"),
+        ("eta_30m",          "INTEGER DEFAULT 0"),
+        ("launch_score",     "INTEGER DEFAULT 0"),
+        ("launch_tier",      "TEXT    DEFAULT 'COLD'"),
+        ("has_twitter",      "INTEGER DEFAULT 0"),
+        ("has_telegram",     "INTEGER DEFAULT 0"),
+        ("has_website",      "INTEGER DEFAULT 0"),
+        # Stable anchor MCap at the moment of first detection. Unlike peak_mcap_usd
+        # (which gets overwritten as the token grows), this never changes after
+        # insert — it's the denominator for every return calculation.
+        ("initial_mcap_usd", "REAL    DEFAULT 0"),
+        # m_5k replaced the old m_10k column (threshold was always $5K, not $10K).
+        ("m_5k",             "INTEGER DEFAULT 0"),
     ]
     for col, typedef in new_cols:
         try:
@@ -106,7 +166,20 @@ def init_prelaunch_tables():
             con.commit()
         except Exception:
             pass
+    # Migrate any existing m_10k data into m_5k for DBs created before the rename.
+    try:
+        con.execute(
+            "UPDATE prelaunch_tokens SET m_5k = m_10k WHERE m_5k = 0 AND m_10k = 1"
+        )
+        con.commit()
+    except Exception:
+        pass
     con.close()
+
+    # Sibling tables live in separate modules but share this DB. Init them
+    # here so a single call to init_prelaunch_tables() sets up everything.
+    init_creator_reputation_table()
+    init_sniper_table()
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -211,10 +284,12 @@ def _add(mint, name, symbol, creator, mcap_usd, sol_price,
     con.execute("""
         INSERT OR IGNORE INTO prelaunch_tokens
         (mint, name, symbol, creator, detected_ts, last_mcap_usd, peak_mcap_usd,
+         initial_mcap_usd,
          last_checked_ts, sol_price, launch_score, launch_tier,
          has_twitter, has_telegram, has_website)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (mint, name, symbol, creator, now, mcap_usd, mcap_usd,
+          mcap_usd,
           now, sol_price, score, tier, has_twitter, has_telegram, has_website))
     con.commit()
     con.close()
@@ -248,7 +323,7 @@ def _flags(mint) -> dict:
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     cur.execute("""
-        SELECT m_10k, m_30k, m_50k, m_grad,
+        SELECT m_5k, m_30k, m_50k, m_grad,
                COALESCE(eta_2h,0), COALESCE(eta_1h,0), COALESCE(eta_30m,0)
         FROM prelaunch_tokens WHERE mint=?
     """, (mint,))
@@ -257,7 +332,7 @@ def _flags(mint) -> dict:
     if not row:
         return {}
     return {
-        "m_10k":   bool(row[0]), "m_30k": bool(row[1]),
+        "m_5k":    bool(row[0]), "m_30k": bool(row[1]),
         "m_50k":   bool(row[2]), "m_grad": bool(row[3]),
         "eta_2h":  bool(row[4]), "eta_1h": bool(row[5]), "eta_30m": bool(row[6]),
     }
@@ -476,8 +551,8 @@ def _check_token(t: dict):
                 f"https://pump.fun/{mint}"
             )
 
-    elif mcap >= 5_000 and not f.get("m_10k"):
-        _mark(mint, "m_10k")
+    elif mcap >= 5_000 and not f.get("m_5k"):
+        _mark(mint, "m_5k")
         if age_min <= 60:
             # Fetch score from DB for richer alert
             con  = sqlite3.connect(DB_PATH)
@@ -494,12 +569,26 @@ def _check_token(t: dict):
             tele = "✈️" if (row and row[3]) else ""
             soc  = " ".join(filter(None, [twit, tele])) or "—"
 
+            # Sniper check — only worth the Helius credits now that the
+            # token has proven it can get off the floor. If the top 5
+            # wallets already own most of the supply, suppress the alert
+            # entirely (tokens dominated by snipers rarely moon).
+            sniper = check_sniper_concentration(mint)
+            if sniper.get("sniped"):
+                print(
+                    f"[PRELAUNCH] Suppressing $5K alert for {symbol} — "
+                    f"sniped (top5={sniper['top5_pct']}%)"
+                )
+                return
+            sniper_line = format_sniper_line(sniper)
+
             _alert(
                 f"PRE-LAUNCH: Gaining Traction!\n\n"
                 f"{name} ({symbol.upper()})\n"
                 f"MCap: {_fmt(mcap)} | Age: {age_min}m\n"
                 f"Score: {sc}/100 [{tier}] | Socials: {soc}\n"
-                f"https://pump.fun/{mint}"
+                + (sniper_line + "\n" if sniper_line else "")
+                + f"https://pump.fun/{mint}"
             )
 
     # ── ETA countdown alerts ──
@@ -575,6 +664,364 @@ def monitor_loop():
             print(f"[PRELAUNCH] Monitor error: {e}")
 
         time.sleep(MONITOR_FRESH_SECS)   # 30 second main loop
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Outcome logging — foundation of the future ML training set
+# ──────────────────────────────────────────────────────────────────────────
+#
+# For every token we detect on pump.fun, we log the outcome at fixed
+# horizons (+1h, +6h, +24h) regardless of whether it's still "active" in
+# the monitor loop. This gives us labeled data to train on later:
+#
+#   features: everything in prelaunch_tokens at detection time
+#             (launch_score, has_twitter, has_telegram, has_website, name, ...)
+#   labels:   prelaunch_outcomes.return_pct / graduated_by_then at +Xh
+#
+# The monitor loop stops tracking tokens after TRACK_HOURS (6h), so for
+# longer horizons we do a one-shot MCap fetch here.
+
+def _get_detected_initial_mcap(mint: str) -> float:
+    """Return the anchor MCap used to compute returns for a token.
+
+    Prefer initial_mcap_usd (stable snapshot at insert time). Fall back to
+    the earliest prelaunch_history row if the column is missing or zero
+    (older rows inserted before this column existed).
+    """
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "SELECT COALESCE(initial_mcap_usd, 0) FROM prelaunch_tokens WHERE mint=?",
+        (mint,),
+    )
+    row = cur.fetchone()
+    initial = float(row[0]) if row and row[0] else 0.0
+
+    if initial <= 0:
+        cur.execute(
+            "SELECT mcap FROM prelaunch_history WHERE mint=? ORDER BY ts ASC LIMIT 1",
+            (mint,),
+        )
+        first = cur.fetchone()
+        if first and first[0]:
+            initial = float(first[0])
+            # Backfill so we don't repeat this lookup.
+            con.execute(
+                "UPDATE prelaunch_tokens SET initial_mcap_usd=? WHERE mint=?",
+                (initial, mint),
+            )
+            con.commit()
+    con.close()
+    return initial
+
+
+def _outcomes_due() -> list:
+    """Find (mint, horizon_min) pairs whose snapshot deadline has passed
+    and which don't yet have a row in prelaunch_outcomes.
+    """
+    now = int(time.time())
+    cutoff = now - OUTCOME_LOOKBACK_HOURS * 3600
+
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        SELECT mint, detected_ts, last_mcap_usd, peak_mcap_usd, graduated
+        FROM prelaunch_tokens
+        WHERE detected_ts > ?
+    """, (cutoff,))
+    tokens = cur.fetchall()
+
+    cur.execute("SELECT mint, horizon_min FROM prelaunch_outcomes")
+    already = {(m, h) for m, h in cur.fetchall()}
+    con.close()
+
+    due = []
+    for mint, detected_ts, last_mcap, peak_mcap, graduated in tokens:
+        age_min = (now - detected_ts) / 60.0
+        for h in OUTCOME_HORIZONS_MIN:
+            if age_min >= h and (mint, h) not in already:
+                due.append({
+                    "mint":          mint,
+                    "horizon_min":   h,
+                    "detected_ts":   detected_ts,
+                    "last_mcap_usd": last_mcap or 0.0,
+                    "peak_mcap_usd": peak_mcap or 0.0,
+                    "graduated":     bool(graduated),
+                    "age_min":       age_min,
+                })
+    # Snapshot the longest-overdue horizons first.
+    due.sort(key=lambda d: d["age_min"] - d["horizon_min"], reverse=True)
+    return due
+
+
+def _record_outcome(mint: str, horizon_min: int,
+                    current_mcap: float, peak_mcap: float,
+                    graduated: bool) -> None:
+    """Insert one outcome row. Idempotent via UNIQUE(mint, horizon_min)."""
+    initial = _get_detected_initial_mcap(mint)
+    return_pct = None
+    if initial and initial > 0:
+        return_pct = ((peak_mcap or 0.0) - initial) / initial * 100.0
+
+    con = sqlite3.connect(DB_PATH)
+    con.execute("""
+        INSERT OR IGNORE INTO prelaunch_outcomes
+        (mint, horizon_min, snapshot_ts,
+         mcap_at_snapshot, peak_mcap_so_far,
+         graduated_by_then, return_pct)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (mint, horizon_min, int(time.time()),
+          float(current_mcap or 0.0), float(peak_mcap or 0.0),
+          1 if graduated else 0, return_pct))
+    con.commit()
+    con.close()
+
+
+def _refresh_mcap_for_old_token(d: dict) -> tuple:
+    """For tokens past the active-monitor window (6h), the DB's
+    last_mcap_usd / peak_mcap_usd are stale. Do a one-shot fetch and
+    update the peak before recording the outcome.
+    """
+    age_hours = d["age_min"] / 60.0
+    current = d["last_mcap_usd"]
+    peak = d["peak_mcap_usd"]
+
+    if age_hours <= TRACK_HOURS:
+        # Active monitor is keeping these fresh enough.
+        return current, peak
+
+    fresh = _fetch_mcap(d["mint"])
+    if fresh > 0:
+        current = fresh
+        peak = max(peak, fresh)
+        con = sqlite3.connect(DB_PATH)
+        con.execute("""
+            UPDATE prelaunch_tokens
+               SET last_mcap_usd = ?,
+                   peak_mcap_usd = MAX(peak_mcap_usd, ?),
+                   last_checked_ts = ?
+             WHERE mint = ?
+        """, (fresh, fresh, int(time.time()), d["mint"]))
+        con.execute(
+            "INSERT INTO prelaunch_history (mint, mcap, ts) VALUES (?,?,?)",
+            (d["mint"], fresh, int(time.time())),
+        )
+        con.commit()
+        con.close()
+    return current, peak
+
+
+def record_outcomes_once() -> int:
+    """Record all outcome snapshots that are currently due. Returns count.
+
+    After recording, incrementally refreshes the reputation of each
+    affected creator so their tier is always based on the latest outcomes.
+    """
+    due = _outcomes_due()
+    recorded = 0
+    touched_creators: set = set()
+    for d in due:
+        try:
+            current, peak = _refresh_mcap_for_old_token(d)
+            _record_outcome(
+                d["mint"], d["horizon_min"],
+                current, peak, d["graduated"],
+            )
+            recorded += 1
+            # Track which creator's stats need refreshing.
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            cur.execute("SELECT creator FROM prelaunch_tokens WHERE mint=?", (d["mint"],))
+            row = cur.fetchone()
+            con.close()
+            if row and row[0]:
+                touched_creators.add(row[0])
+            # Gentle on APIs when the backlog is large.
+            time.sleep(0.3)
+        except Exception as e:
+            print(f"[OUTCOMES] Record error {d['mint'][:8]} @ {d['horizon_min']}m: {e}")
+
+    for c in touched_creators:
+        try:
+            recompute_creator(c)
+        except Exception as e:
+            print(f"[OUTCOMES] Creator recompute error {c[:8]}: {e}")
+    if touched_creators:
+        print(f"[OUTCOMES] Refreshed reputation for {len(touched_creators)} creator(s)")
+    return recorded
+
+
+def outcome_poll_loop():
+    """Background loop: every OUTCOME_POLL_INTERVAL seconds, snapshot any
+    tokens that have crossed a horizon boundary since last poll.
+    """
+    time.sleep(60)  # let the WS listener warm up first
+    while True:
+        try:
+            n = record_outcomes_once()
+            if n:
+                print(f"[OUTCOMES] Recorded {n} outcome snapshot(s)")
+        except Exception as e:
+            print(f"[OUTCOMES] Loop error: {e}")
+        time.sleep(OUTCOME_POLL_INTERVAL)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Creator reputation — periodic full recompute
+# ──────────────────────────────────────────────────────────────────────────
+
+CREATOR_RECOMPUTE_INTERVAL = 3600   # hourly — catches late outcomes
+
+
+def creator_recompute_loop():
+    """Hourly full sweep of creator_reputation to pick up any drift the
+    incremental-update path in record_outcomes_once() might have missed
+    (e.g. edge cases where a creator's token was deleted, or a creator's
+    stats rolled across a tier boundary thanks to a live peak update).
+    """
+    time.sleep(300)  # stagger 5m after startup
+    while True:
+        try:
+            n = recompute_all_creators()
+            if n:
+                print(f"[CREATOR_REP] Recomputed {n} creator(s)")
+        except Exception as e:
+            print(f"[CREATOR_REP] Loop error: {e}")
+        time.sleep(CREATOR_RECOMPUTE_INTERVAL)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# ML retrainer — automatic when enough data exists
+# ──────────────────────────────────────────────────────────────────────────
+
+RETRAIN_INTERVAL_HOURS = 12   # re-evaluate twice a day; trainer itself
+                              # aborts cheaply if data requirements unmet
+
+
+def retrain_loop():
+    """Periodically attempt to (re)train the pump.fun XGBoost model.
+
+    pumpfun_trainer.train_pumpfun_model() has hard guards on dataset size,
+    distinct days, and positive class count — it simply returns a reason
+    dict and skips saving if prerequisites aren't met. That means this
+    loop is safe to run from day 1: it becomes a no-op cost of a single
+    DataFrame build every 12h until enough outcome data has accumulated,
+    at which point it silently starts producing models.
+    """
+    # Wait long enough after startup that the outcome logger has had a
+    # chance to backfill anything due.
+    time.sleep(900)
+    while True:
+        try:
+            from app.pumpfun_trainer import train_pumpfun_model
+            report = train_pumpfun_model()
+            if report.get("ok"):
+                print(f"[RETRAIN] New model saved. Metrics: {report['metrics']}")
+                # Hot-reload live_scorer so the next detected token uses it.
+                try:
+                    import app.live_scorer as ls
+                    ls._loaded = False
+                    ls._model = None
+                    ls._features = None
+                except Exception:
+                    pass
+            else:
+                print(f"[RETRAIN] Skipped: {report.get('reason', 'unknown')}")
+        except Exception as e:
+            print(f"[RETRAIN] Loop error: {e}")
+        time.sleep(RETRAIN_INTERVAL_HOURS * 3600)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# /stats command — rolling validation of the current heuristic
+# ──────────────────────────────────────────────────────────────────────────
+
+def format_stats() -> str:
+    """Human-readable performance summary for the /stats Telegram command.
+
+    Answers the only question that matters: is the current scoring
+    actually predictive of outcomes? Breaks down graduation rate and
+    median/max 6h return by launch_tier and shows the top creators.
+    """
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+
+    cur.execute("SELECT COUNT(*) FROM prelaunch_tokens")
+    total_tokens = int(cur.fetchone()[0] or 0)
+
+    cur.execute("""
+        SELECT COUNT(*) FROM prelaunch_outcomes WHERE horizon_min = 360
+    """)
+    total_outcomes_6h = int(cur.fetchone()[0] or 0)
+
+    # Per-tier stats joining the latest tier assignment with 6h outcomes.
+    cur.execute("""
+        SELECT t.launch_tier,
+               COUNT(*) AS n,
+               SUM(CASE WHEN o.graduated_by_then = 1 THEN 1 ELSE 0 END) AS grads,
+               AVG(o.return_pct),
+               MAX(o.return_pct)
+        FROM prelaunch_tokens t
+        INNER JOIN prelaunch_outcomes o
+                ON o.mint = t.mint AND o.horizon_min = 360
+        GROUP BY t.launch_tier
+    """)
+    tier_rows = cur.fetchall()
+
+    # Sniper-suppression effectiveness.
+    cur.execute("""
+        SELECT
+          SUM(CASE WHEN s.sniped = 1 THEN 1 ELSE 0 END) AS sniped,
+          SUM(CASE WHEN s.sniped = 0 AND s.label='CLEAN' THEN 1 ELSE 0 END) AS clean,
+          COUNT(*) AS total
+        FROM sniper_checks s
+    """)
+    srow = cur.fetchone() or (0, 0, 0)
+    con.close()
+
+    lines = [
+        "Stats — AI Token Finder Performance",
+        "",
+        f"Total tokens tracked: {total_tokens}",
+        f"Outcomes recorded (+6h): {total_outcomes_6h}",
+    ]
+    lines.append(f"ML model loaded: {'YES' if model_is_available() else 'no (still accumulating data)'}")
+    lines.append("")
+    lines.append("By Launch Tier (6h horizon):")
+    if not tier_rows:
+        lines.append("  (no outcomes yet — keep the bot running)")
+    else:
+        for tier, n, grads, avg_ret, max_ret in tier_rows:
+            grad_rate = (grads / n * 100) if n else 0
+            avg_ret = avg_ret if avg_ret is not None else 0
+            max_ret = max_ret if max_ret is not None else 0
+            lines.append(
+                f"  {tier}: n={n} | grads={grads} ({grad_rate:.0f}%) | "
+                f"avg={avg_ret:+.0f}% | max={max_ret:+.0f}%"
+            )
+
+    if srow and srow[2]:
+        sniped, clean, total = srow
+        lines.append("")
+        lines.append(
+            f"Sniper checks: {total} total | sniped={sniped} | clean={clean}"
+        )
+
+    winners = top_creators(limit=5, min_launches=2)
+    if winners:
+        lines.append("")
+        lines.append("Top Creators (min 2 launches):")
+        for w in winners:
+            c = (w["creator"] or "")[:8] + "…"
+            lines.append(
+                f"  {c} [{w['tier']}] | launches={w['total_launches']} | "
+                f"grads={w['graduations']} | peak=${w['max_peak_mcap_usd']:,.0f}"
+            )
+
+    lines.append("")
+    lines.append("A meaningful HOT tier should beat WARM beat COLD.")
+    lines.append("If they're indistinguishable, the heuristic is noise.")
+    return "\n".join(lines)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -657,9 +1104,46 @@ async def _ws_listen():
                         # ── Score token at creation ──
                         score, reasons, tier = score_new_token(msg, sol)
 
+                        # Creator-wallet reputation boost. A wallet that has
+                        # graduated tokens before is the single strongest
+                        # pre-launch signal available on-chain — stronger
+                        # than any social metadata.
+                        cstats = get_creator_stats(creator) if creator else {}
+                        ctier = cstats.get("tier", "UNKNOWN")
+                        if ctier == "WINNER":
+                            tier = "HOT"
+                            reasons.insert(
+                                0,
+                                f"Creator WINNER ({cstats.get('graduations',0)}/"
+                                f"{cstats.get('total_launches',0)} grads)"
+                            )
+                            score = min(100, score + 25)
+                        elif ctier == "RUGGER":
+                            # Serial rugger — never alert, always cold.
+                            tier = "COLD"
+                            reasons.insert(0, "Creator RUGGER — suppressed")
+
+                        # Optional ML tier adjustment. Only fires once a trained
+                        # model exists on disk; no-op otherwise.
+                        ml_ctx = {
+                            "mint":             mint,
+                            "name":             name,
+                            "creator":          creator,
+                            "initial_mcap_usd": mcap_usd,
+                            "launch_score":     score,
+                            "launch_tier":      tier,
+                            "has_twitter":      1 if msg.get("twitter")  else 0,
+                            "has_telegram":     1 if msg.get("telegram") else 0,
+                            "has_website":      1 if msg.get("website")  else 0,
+                        }
+                        tier, ml_prob = ml_adjust_tier(tier, ml_ctx)
+                        if ml_prob is not None:
+                            reasons.append(f"ML={ml_prob:.2f}")
+
                         print(
                             f"[PRELAUNCH] New: {name} ({symbol}) "
                             f"MCap ${mcap_usd:,.0f} | Score:{score} [{tier}]"
+                            f"{' | CreatorTier:' + ctier if ctier != 'UNKNOWN' else ''}"
                         )
 
                         _add(mint, name, symbol, creator, mcap_usd, sol,
@@ -718,7 +1202,7 @@ async def _ws_listen():
                             # Sort by score, show top 5
                             top = sorted(unique, key=lambda x: x["score"], reverse=True)[:5]
                             if top:
-                                tier_icon = {"HOT": "", "WARM": "", "COLD": ""}
+                                tier_icon = {"HOT": "🔥", "WARM": "🟡", "COLD": "❄️"}
                                 lines = [f"New Launches — {len(top)} Promising Tokens\n"]
                                 for t in top:
                                     icon = tier_icon.get(t["tier"], "")
@@ -750,7 +1234,17 @@ def start_listener():
 
     threading.Thread(target=_run, daemon=True).start()
     threading.Thread(target=monitor_loop, daemon=True).start()
-    print("[PRELAUNCH] Tracker started")
+    # Outcome logger — independent of the active-monitor window so it can
+    # capture 24h-horizon labels for tokens that have long since stopped
+    # being tracked. This table is what future ML training reads from.
+    threading.Thread(target=outcome_poll_loop, daemon=True).start()
+    # Creator reputation — hourly full sweep so tier assignments reflect
+    # the latest outcomes even when incremental updates missed an edge case.
+    threading.Thread(target=creator_recompute_loop, daemon=True).start()
+    # ML retrainer — cheap no-op until ~300 rows and 7 distinct days of
+    # data have accumulated; produces a model automatically once they have.
+    threading.Thread(target=retrain_loop, daemon=True).start()
+    print("[PRELAUNCH] Tracker started (outcomes + creator-rep + ML retrainer)")
 
 
 # ──────────────────────────────────────────────────────────────────────────

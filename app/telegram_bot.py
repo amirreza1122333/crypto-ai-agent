@@ -30,6 +30,7 @@ from app.portfolio import init_portfolio_table, add_holding, remove_holding, get
 from app.prelaunch_tracker import (
     init_prelaunch_tables, start_listener, register_callback,
     format_prelaunch_list, format_upcoming, format_preorder_list,
+    format_stats,
 )
 
 # -----------------------------
@@ -447,9 +448,9 @@ def format_top(title: str, data: dict) -> str:
             f"{i}. {c.get('name', '-')} ({str(c.get('symbol', '-')).upper()})\n"
             f"Score: {c.get('final_score', 0):.3f}\n"
             f"{trend_emoji(trend)} {trend} | {risk_emoji(risk)} {risk}\n"
-           f"{signal_emoji(signal_type)} {signal_type}\n"
-           f"🤖 AI: {prob:.2f} | {ai}\n"
-           f"Action: {action} | Confidence: {confidence}%\n\n"
+            f"{signal_emoji(signal_type)} {signal_type}\n"
+            f"🤖 AI: {prob:.2f} | {ai}\n"
+            f"Action: {action} | Confidence: {confidence}%\n\n"
         )
 
     return text.strip()
@@ -558,7 +559,8 @@ def help_text() -> str:
         "/gems_off - disable gem alerts\n"
         "/preorder - HOT fresh tokens < 2h old, growing fast\n"
         "/upcoming - tokens approaching DEX graduation (with ETA)\n"
-        "/prelaunch - all detected pre-launch tokens (last 6h)\n\n"
+        "/prelaunch - all detected pre-launch tokens (last 6h)\n"
+        "/stats - AI performance: tier win rates, top creators\n\n"
         "/settings - your current settings\n"
         "/start - restart bot\n"
     )
@@ -802,7 +804,7 @@ def send_watchlist_alerts():
             for c in matches:
                 symbol = str(c.get("symbol", "")).upper()
                 if not should_send_alert_advanced(chat_id, c):
-                  continue
+                    continue
 
                 risk = c.get("risk_level", "-")
                 trend = c.get("trend", "-")
@@ -1500,6 +1502,9 @@ def main():
                 elif text == "/preorder":
                     send_message(chat_id, "Scanning hot pre-launch tokens...")
                     send_message(chat_id, format_preorder_list())
+
+                elif text == "/stats":
+                    send_message(chat_id, format_stats())
 
                 else:
                     send_message(chat_id, f"Unknown command: {text}\nType /help for all commands.")
