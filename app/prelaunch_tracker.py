@@ -63,6 +63,13 @@ FRESH_TOKEN_MINUTES   = 15      # tokens under this age get priority checking
 MONITOR_CRITICAL_SECS = 15      # tokens near graduation checked every 15 seconds
 IMMINENT_MCAP_USD     = 35_000  # start "critical" tracking above $35K (~54% to grad)
 IMMINENT_ETA_MIN      = 20      # fire imminent alert when ETA drops below 20 min
+NEAR_GRAD_MCAP        = 50_000  # $50K = 77% to graduation — alert even without ETA data
+
+# Graduation zone scanner — polls pump.fun API for tokens already mid-flight
+GRAD_ZONE_POLL_SECS   = 60      # scan every 60 seconds
+GRAD_ZONE_MIN_MCAP    = 30_000  # lower bound of zone
+GRAD_ZONE_MAX_MCAP    = 65_000  # upper bound (graduation threshold)
+GRAD_ZONE_API_LIMIT   = 50      # tokens per API page
 
 _alert_callbacks: list = []  # registered Telegram send functions
 
@@ -632,8 +639,10 @@ def _check_token(t: dict):
                 + f"https://pump.fun/{mint}"
             )
 
-    # ── Imminent DEX launch — fires once when ETA drops under IMMINENT_ETA_MIN ──
-    if (mcap >= IMMINENT_MCAP_USD and 0 < eta <= IMMINENT_ETA_MIN
+    # ── Imminent DEX launch — fires on ETA threshold OR MCap proximity ──
+    imminent_by_eta  = (0 < eta <= IMMINENT_ETA_MIN)
+    imminent_by_mcap = (mcap >= NEAR_GRAD_MCAP)   # 77%+ to graduation = imminent
+    if (mcap >= IMMINENT_MCAP_USD and (imminent_by_eta or imminent_by_mcap)
             and not f.get("m_imminent")):
         _mark(mint, "m_imminent")
 
@@ -681,8 +690,9 @@ def _check_token(t: dict):
         sniper      = check_sniper_concentration(mint)
         sniper_line = format_sniper_line(sniper)
 
+        eta_label = f"~{eta}min to Raydium" if eta > 0 else f"{pct:.0f}% to graduation"
         _alert(
-            f"IMMINENT DEX LAUNCH — ~{eta}min to Raydium!\n\n"
+            f"IMMINENT DEX LAUNCH — {eta_label}!\n\n"
             f"{name} ({symbol.upper()})\n"
             f"MCap: {_fmt(mcap)} | Age: {age_min}m\n"
             f"[{bar}] {pct:.0f}% to graduation\n"
@@ -1343,6 +1353,129 @@ async def _ws_listen():
             await asyncio.sleep(5)
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Graduation Zone Scanner — discovers tokens already mid-flight
+# ──────────────────────────────────────────────────────────────────────────
+#
+# The WebSocket only fires at token CREATION. If the bot restarts, or if a
+# token pumped quietly while we weren't watching, it never enters our DB.
+# This scanner polls the pump.fun API every 60 s for ALL tokens currently
+# in the $30K–$65K bonding curve zone and adds any unknown ones so the
+# monitor_loop picks them up immediately.
+
+def _fetch_graduation_zone() -> list:
+    """Return pump.fun tokens currently in the graduation zone ($30K–$65K)."""
+    found = []
+    try:
+        r = requests.get(
+            "https://frontend-api.pump.fun/coins",
+            params={
+                "offset":       0,
+                "limit":        GRAD_ZONE_API_LIMIT,
+                "sort":         "market_cap",
+                "order":        "DESC",
+                "includeNsfw":  "true",
+            },
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://pump.fun/"},
+            timeout=12, verify=False,
+        )
+        if r.status_code != 200:
+            print(f"[GRAD_ZONE] API returned {r.status_code}")
+            return []
+        coins = r.json()
+        if not isinstance(coins, list):
+            return []
+        for c in coins:
+            mcap = float(c.get("usd_market_cap") or 0)
+            if GRAD_ZONE_MIN_MCAP <= mcap < GRAD_ZONE_MAX_MCAP:
+                if not c.get("complete", False):   # exclude already-graduated
+                    found.append(c)
+    except Exception as e:
+        print(f"[GRAD_ZONE] Fetch error: {e}")
+    return found
+
+
+def _ingest_zone_token(c: dict, sol_price: float) -> bool:
+    """Add a graduation-zone token to our DB if not yet tracked.
+
+    Returns True when a brand-new token was inserted, False when it already
+    existed (we still update its MCap so the monitor stays fresh).
+    """
+    mint    = (c.get("mint") or "").strip()
+    name    = (c.get("name")   or "Unknown").strip()
+    symbol  = (c.get("symbol") or "?").strip()
+    creator = (c.get("creator") or "").strip()
+    mcap    = float(c.get("usd_market_cap") or 0)
+
+    if not mint or mcap <= 0:
+        return False
+
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT mint FROM prelaunch_tokens WHERE mint=?", (mint,))
+    exists = cur.fetchone() is not None
+    con.close()
+
+    if exists:
+        _update(mint, mcap)   # keep history points fresh for ETA calculation
+        return False
+
+    # Brand-new discovery — score it using available metadata
+    meta = {
+        "name":         name,
+        "description":  (c.get("description") or ""),
+        "twitter":      (c.get("twitter")     or ""),
+        "telegram":     (c.get("telegram")    or ""),
+        "website":      (c.get("website")     or ""),
+        "marketCapSol": mcap / sol_price if sol_price > 0 else 0,
+    }
+    score, _reasons, tier = score_new_token(meta, sol_price)
+
+    # Tokens already near graduation deserve at least WARM so monitor watches them
+    if tier == "COLD" and mcap >= IMMINENT_MCAP_USD:
+        tier = "WARM"
+
+    _add(mint, name, symbol, creator, mcap, sol_price,
+         score=score, tier=tier,
+         has_twitter=1  if meta["twitter"]  else 0,
+         has_telegram=1 if meta["telegram"] else 0,
+         has_website=1  if meta["website"]  else 0)
+
+    # Seed one history point so _eta_minutes() has a starting reference
+    _update(mint, mcap)
+
+    print(
+        f"[GRAD_ZONE] Discovered: {name} ({symbol}) "
+        f"MCap={_fmt(mcap)} Score={score} [{tier}]"
+    )
+    return True
+
+
+def graduation_zone_loop():
+    """Background loop: scan pump.fun every 60 s for mid-flight tokens."""
+    time.sleep(45)   # stagger after startup so WS listener warms up first
+    while True:
+        try:
+            sol  = _cached_sol_price()
+            zone = _fetch_graduation_zone()
+            new_count = 0
+            for c in zone:
+                try:
+                    if _ingest_zone_token(c, sol):
+                        new_count += 1
+                    time.sleep(0.15)
+                except Exception as e:
+                    print(f"[GRAD_ZONE] Ingest error: {e}")
+            if zone:
+                print(
+                    f"[GRAD_ZONE] Scanned {len(zone)} zone token(s)"
+                    + (f", {new_count} new" if new_count else "")
+                )
+        except Exception as e:
+            print(f"[GRAD_ZONE] Loop error: {e}")
+        time.sleep(GRAD_ZONE_POLL_SECS)
+
+
 def start_listener():
     if not WS_AVAILABLE:
         print("[PRELAUNCH] websockets not installed, listener skipped")
@@ -1365,7 +1498,9 @@ def start_listener():
     # ML retrainer — cheap no-op until ~300 rows and 7 distinct days of
     # data have accumulated; produces a model automatically once they have.
     threading.Thread(target=retrain_loop, daemon=True).start()
-    print("[PRELAUNCH] Tracker started (outcomes + creator-rep + ML retrainer)")
+    # Graduation zone scanner — finds tokens already mid-flight that the WS missed.
+    threading.Thread(target=graduation_zone_loop, daemon=True).start()
+    print("[PRELAUNCH] Tracker started (outcomes + creator-rep + ML retrainer + grad-zone scanner)")
 
 
 # ──────────────────────────────────────────────────────────────────────────
