@@ -1354,126 +1354,190 @@ async def _ws_listen():
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Graduation Zone Scanner — discovers tokens already mid-flight
+# Graduation Zone Scanner — WebSocket trade feed (replaces broken REST API)
 # ──────────────────────────────────────────────────────────────────────────
 #
-# The WebSocket only fires at token CREATION. If the bot restarts, or if a
-# token pumped quietly while we weren't watching, it never enters our DB.
-# This scanner polls the pump.fun API every 60 s for ALL tokens currently
-# in the $30K–$65K bonding curve zone and adds any unknown ones so the
-# monitor_loop picks them up immediately.
+# pump.fun's REST API is Cloudflare-blocked globally. Instead we open a
+# SECOND WebSocket connection to pumpportal.fun and subscribe to ALL token
+# trade events. Every buy/sell carries the current marketCapSol, so we see
+# the live MCap for every actively-traded token.
+#
+# When a trade comes in for a token we don't know:
+#   MCap in [$30K, $65K) → fetch metadata from pump.fun, add to DB.
+#                           monitor_loop picks it up within 15 seconds.
+#   MCap outside zone    → ignore (we only care about graduation-zone tokens)
+#
+# For tokens we already track, we update their MCap in real time, giving
+# _eta_minutes() more data points and improving ETA accuracy.
 
-def _fetch_graduation_zone() -> list:
-    """Return pump.fun tokens currently in the graduation zone ($30K–$65K)."""
-    found = []
+# Deduplicate discovery fetches — don't hammer pump.fun API for the same
+# unknown mint repeatedly while we're waiting for the fetch to complete.
+_zone_discovery_pending: set = set()
+
+
+async def _fetch_token_metadata(mint: str) -> dict:
+    """One-shot pump.fun API fetch for name/symbol/socials of a discovered token."""
     try:
-        r = requests.get(
-            "https://frontend-api.pump.fun/coins",
-            params={
-                "offset":       0,
-                "limit":        GRAD_ZONE_API_LIMIT,
-                "sort":         "market_cap",
-                "order":        "DESC",
-                "includeNsfw":  "true",
-            },
-            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://pump.fun/"},
-            timeout=12, verify=False,
+        resp = await asyncio.wait_for(
+            asyncio.to_thread(
+                lambda: requests.get(
+                    f"https://frontend-api.pump.fun/coins/{mint}",
+                    headers={"User-Agent": "Mozilla/5.0", "Referer": "https://pump.fun/"},
+                    timeout=6, verify=False,
+                )
+            ),
+            timeout=8,
         )
-        if r.status_code != 200:
-            print(f"[GRAD_ZONE] API returned {r.status_code}")
-            return []
-        coins = r.json()
-        if not isinstance(coins, list):
-            return []
-        for c in coins:
-            mcap = float(c.get("usd_market_cap") or 0)
-            if GRAD_ZONE_MIN_MCAP <= mcap < GRAD_ZONE_MAX_MCAP:
-                if not c.get("complete", False):   # exclude already-graduated
-                    found.append(c)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return {}
+
+
+async def _ingest_trade_token(mint: str, mcap_usd: float, sol_price: float) -> None:
+    """Discover and add a graduation-zone token found via the trade feed."""
+    if mint in _zone_discovery_pending:
+        return
+    _zone_discovery_pending.add(mint)
+    try:
+        # Small delay so pump.fun API has time to index the token
+        await asyncio.sleep(1)
+        meta = await _fetch_token_metadata(mint)
+
+        name    = (meta.get("name")    or "Unknown").strip()
+        symbol  = (meta.get("symbol")  or "?").strip()
+        creator = (meta.get("creator") or "").strip()
+
+        ws_msg = {
+            "name":         name,
+            "description":  (meta.get("description") or ""),
+            "twitter":      (meta.get("twitter")     or ""),
+            "telegram":     (meta.get("telegram")    or ""),
+            "website":      (meta.get("website")     or ""),
+            "marketCapSol": mcap_usd / sol_price if sol_price > 0 else 0,
+        }
+        score, _reasons, tier = score_new_token(ws_msg, sol_price)
+
+        # Tokens already deep in the graduation zone get at least WARM
+        if tier == "COLD" and mcap_usd >= IMMINENT_MCAP_USD:
+            tier = "WARM"
+
+        _add(mint, name, symbol, creator, mcap_usd, sol_price,
+             score=score, tier=tier,
+             has_twitter=1  if ws_msg["twitter"]  else 0,
+             has_telegram=1 if ws_msg["telegram"] else 0,
+             has_website=1  if ws_msg["website"]  else 0)
+        _update(mint, mcap_usd)   # seed history point for ETA calculation
+
+        print(
+            f"[GRAD_ZONE] Discovered via trade: {name} ({symbol}) "
+            f"MCap={_fmt(mcap_usd)} Score={score} [{tier}]"
+        )
     except Exception as e:
-        print(f"[GRAD_ZONE] Fetch error: {e}")
+        print(f"[GRAD_ZONE] Ingest error {mint[:8]}: {e}")
+    finally:
+        _zone_discovery_pending.discard(mint)
+
+
+def _is_known(mint: str) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT 1 FROM prelaunch_tokens WHERE mint=?", (mint,))
+    found = cur.fetchone() is not None
+    con.close()
     return found
 
 
-def _ingest_zone_token(c: dict, sol_price: float) -> bool:
-    """Add a graduation-zone token to our DB if not yet tracked.
-
-    Returns True when a brand-new token was inserted, False when it already
-    existed (we still update its MCap so the monitor stays fresh).
+async def _trade_feed_listen():
     """
-    mint    = (c.get("mint") or "").strip()
-    name    = (c.get("name")   or "Unknown").strip()
-    symbol  = (c.get("symbol") or "?").strip()
-    creator = (c.get("creator") or "").strip()
-    mcap    = float(c.get("usd_market_cap") or 0)
+    Second WebSocket connection — subscribes to ALL pump.fun token trades.
+    Each trade event contains marketCapSol, so we see live MCap without
+    any REST API call. Unknown tokens in the graduation zone are added to DB.
+    """
+    while True:
+        try:
+            print("[GRAD_ZONE] Connecting trade feed WebSocket...")
+            async with websockets.connect(
+                PUMPFUN_WS,
+                additional_headers={
+                    "Origin":     "https://pump.fun",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                },
+                ping_interval=20,
+                ping_timeout=10,
+            ) as ws:
+                # subscribeTokenTrade without keys = all pump.fun trades
+                await ws.send(json.dumps({"method": "subscribeTokenTrade"}))
+                print("[GRAD_ZONE] Trade feed subscribed — watching all pump.fun trades")
 
-    if not mint or mcap <= 0:
-        return False
+                async for raw in ws:
+                    try:
+                        msg = json.loads(raw)
+                        txtype = msg.get("txType", "")
+                        if txtype not in ("buy", "sell"):
+                            continue
 
+                        mint     = msg.get("mint", "")
+                        mcap_sol = float(msg.get("marketCapSol") or 0)
+                        if not mint or mcap_sol <= 0:
+                            continue
+
+                        sol      = _cached_sol_price()
+                        mcap_usd = mcap_sol * sol
+
+                        if _is_known(mint):
+                            # Update MCap for tokens we already track
+                            if mcap_usd > 0:
+                                _update(mint, mcap_usd)
+                        elif GRAD_ZONE_MIN_MCAP <= mcap_usd < GRAD_ZONE_MAX_MCAP:
+                            # Unknown token in graduation zone — discover it
+                            asyncio.ensure_future(_ingest_trade_token(mint, mcap_usd, sol))
+
+                    except Exception as e:
+                        print(f"[GRAD_ZONE] Parse error: {e}")
+
+        except Exception as e:
+            print(f"[GRAD_ZONE] Trade feed error: {e} — retry in 5s")
+            await asyncio.sleep(5)
+
+
+def _fetch_graduation_zone() -> list:
+    """
+    Return currently tracked tokens in the graduation zone for /gradzone command.
+    Uses our own DB (populated by the trade feed) — no external API needed.
+    """
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
-    cur.execute("SELECT mint FROM prelaunch_tokens WHERE mint=?", (mint,))
-    exists = cur.fetchone() is not None
+    cutoff = int(time.time()) - TRACK_HOURS * 3600
+    cur.execute("""
+        SELECT mint, name, symbol, last_mcap_usd, has_twitter, has_telegram,
+               launch_score, launch_tier, detected_ts
+        FROM prelaunch_tokens
+        WHERE last_mcap_usd >= ? AND last_mcap_usd < ?
+          AND graduated = 0
+          AND detected_ts > ?
+        ORDER BY last_mcap_usd DESC
+    """, (GRAD_ZONE_MIN_MCAP, GRAD_ZONE_MAX_MCAP, cutoff))
+    rows = cur.fetchall()
     con.close()
-
-    if exists:
-        _update(mint, mcap)   # keep history points fresh for ETA calculation
-        return False
-
-    # Brand-new discovery — score it using available metadata
-    meta = {
-        "name":         name,
-        "description":  (c.get("description") or ""),
-        "twitter":      (c.get("twitter")     or ""),
-        "telegram":     (c.get("telegram")    or ""),
-        "website":      (c.get("website")     or ""),
-        "marketCapSol": mcap / sol_price if sol_price > 0 else 0,
-    }
-    score, _reasons, tier = score_new_token(meta, sol_price)
-
-    # Tokens already near graduation deserve at least WARM so monitor watches them
-    if tier == "COLD" and mcap >= IMMINENT_MCAP_USD:
-        tier = "WARM"
-
-    _add(mint, name, symbol, creator, mcap, sol_price,
-         score=score, tier=tier,
-         has_twitter=1  if meta["twitter"]  else 0,
-         has_telegram=1 if meta["telegram"] else 0,
-         has_website=1  if meta["website"]  else 0)
-
-    # Seed one history point so _eta_minutes() has a starting reference
-    _update(mint, mcap)
-
-    print(
-        f"[GRAD_ZONE] Discovered: {name} ({symbol}) "
-        f"MCap={_fmt(mcap)} Score={score} [{tier}]"
-    )
-    return True
+    return [
+        {
+            "mint":         r[0], "name":       r[1], "symbol":      r[2],
+            "usd_market_cap": r[3],
+            "twitter":      r[4], "telegram":   r[5],
+            "launch_score": r[6], "launch_tier": r[7],
+            "detected_ts":  r[8],
+        }
+        for r in rows
+    ]
 
 
 def graduation_zone_loop():
-    """Background loop: scan pump.fun every 60 s for mid-flight tokens."""
-    time.sleep(45)   # stagger after startup so WS listener warms up first
-    while True:
-        try:
-            sol  = _cached_sol_price()
-            zone = _fetch_graduation_zone()
-            new_count = 0
-            for c in zone:
-                try:
-                    if _ingest_zone_token(c, sol):
-                        new_count += 1
-                    time.sleep(0.15)
-                except Exception as e:
-                    print(f"[GRAD_ZONE] Ingest error: {e}")
-            if zone:
-                print(
-                    f"[GRAD_ZONE] Scanned {len(zone)} zone token(s)"
-                    + (f", {new_count} new" if new_count else "")
-                )
-        except Exception as e:
-            print(f"[GRAD_ZONE] Loop error: {e}")
-        time.sleep(GRAD_ZONE_POLL_SECS)
+    """Run the async trade-feed listener in its own event loop (background thread)."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(_trade_feed_listen())
 
 
 def start_listener():

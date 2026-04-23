@@ -31,7 +31,7 @@ from app.prelaunch_tracker import (
     init_prelaunch_tables, start_listener, register_callback,
     format_prelaunch_list, format_upcoming, format_preorder_list,
     format_imminent, format_stats,
-    _fetch_graduation_zone, _fmt as _pfmt, _cached_sol_price, GRADUATION_MCAP,
+    _fetch_graduation_zone, _fmt as _pfmt, GRADUATION_MCAP,
 )
 
 # -----------------------------
@@ -1497,16 +1497,19 @@ def main():
                         send_message(chat_id, "Portfolio commands:\n/port - show\n/port add BTC 0.5 95000\n/port remove BTC")
 
                 elif text == "/gradzone":
-                    send_message(chat_id, "Scanning pump.fun graduation zone ($30K-$65K)...")
+                    send_message(chat_id, "Checking graduation zone ($30K-$65K)...")
                     try:
-                        sol  = _cached_sol_price()
                         zone = _fetch_graduation_zone()
                         if not zone:
-                            send_message(chat_id, "Graduation Zone\n\nNo tokens in the $30K-$65K zone right now.\nCheck back in a minute.")
+                            send_message(chat_id,
+                                "Graduation Zone\n\n"
+                                "No tracked tokens in the $30K-$65K zone yet.\n\n"
+                                "The trade feed discovers tokens as they trade.\n"
+                                "Check back in 1-2 minutes after startup, or wait\n"
+                                "for the next active token to appear.")
                         else:
-                            zone_sorted = sorted(zone, key=lambda c: float(c.get("usd_market_cap") or 0), reverse=True)
-                            lines = [f"Graduation Zone — {len(zone_sorted)} token(s) in $30K-$65K\n"]
-                            for i, c in enumerate(zone_sorted[:8], 1):
+                            lines = [f"Graduation Zone — {len(zone)} token(s) in $30K-$65K\n"]
+                            for i, c in enumerate(zone[:8], 1):
                                 mcap   = float(c.get("usd_market_cap") or 0)
                                 pct    = min(mcap / GRADUATION_MCAP * 100, 100)
                                 filled = int(pct / 10)
@@ -1514,13 +1517,15 @@ def main():
                                 tw     = "𝕏" if c.get("twitter") else ""
                                 tg     = "✈️" if c.get("telegram") else ""
                                 soc    = " ".join(filter(None, [tw, tg])) or "—"
+                                age_m  = int((time.time() - c["detected_ts"]) / 60)
                                 lines.append(
-                                    f"{i}. {c.get('name','?')} ({(c.get('symbol') or '?').upper()})\n"
+                                    f"{i}. {c['name']} ({c['symbol'].upper()})\n"
                                     f"   MCap: {_pfmt(mcap)} | [{bar}] {pct:.0f}%\n"
+                                    f"   Age: {age_m}m | Score: {c['launch_score']}/100 [{c['launch_tier']}]\n"
                                     f"   Socials: {soc}\n"
-                                    f"   https://pump.fun/{c.get('mint','')}\n"
+                                    f"   https://pump.fun/{c['mint']}\n"
                                 )
-                            lines.append("These tokens are approaching the $69K Raydium listing threshold.")
+                            lines.append("Approaching $69K Raydium listing. Buy before graduation!")
                             send_message(chat_id, "\n".join(lines))
                     except Exception as e:
                         send_message(chat_id, f"Grad zone error: {e}")
