@@ -60,6 +60,9 @@ TRACK_HOURS           = 6       # stop tracking after 6 hours
 MONITOR_FRESH_SECS    = 30      # check tokens < 15 min old every 30 seconds
 MONITOR_VETERAN_SECS  = 120     # check older tokens every 2 minutes
 FRESH_TOKEN_MINUTES   = 15      # tokens under this age get priority checking
+MONITOR_CRITICAL_SECS = 15      # tokens near graduation checked every 15 seconds
+IMMINENT_MCAP_USD     = 35_000  # start "critical" tracking above $35K (~54% to grad)
+IMMINENT_ETA_MIN      = 20      # fire imminent alert when ETA drops below 20 min
 
 _alert_callbacks: list = []  # registered Telegram send functions
 
@@ -159,6 +162,8 @@ def init_prelaunch_tables():
         ("initial_mcap_usd", "REAL    DEFAULT 0"),
         # m_5k replaced the old m_10k column (threshold was always $5K, not $10K).
         ("m_5k",             "INTEGER DEFAULT 0"),
+        # Fired once when token is < IMMINENT_ETA_MIN minutes from graduation.
+        ("m_imminent",       "INTEGER DEFAULT 0"),
     ]
     for col, typedef in new_cols:
         try:
@@ -324,7 +329,8 @@ def _flags(mint) -> dict:
     cur = con.cursor()
     cur.execute("""
         SELECT m_5k, m_30k, m_50k, m_grad,
-               COALESCE(eta_2h,0), COALESCE(eta_1h,0), COALESCE(eta_30m,0)
+               COALESCE(eta_2h,0), COALESCE(eta_1h,0), COALESCE(eta_30m,0),
+               COALESCE(m_imminent,0)
         FROM prelaunch_tokens WHERE mint=?
     """, (mint,))
     row = cur.fetchone()
@@ -332,9 +338,10 @@ def _flags(mint) -> dict:
     if not row:
         return {}
     return {
-        "m_5k":    bool(row[0]), "m_30k": bool(row[1]),
-        "m_50k":   bool(row[2]), "m_grad": bool(row[3]),
-        "eta_2h":  bool(row[4]), "eta_1h": bool(row[5]), "eta_30m": bool(row[6]),
+        "m_5k":      bool(row[0]), "m_30k":    bool(row[1]),
+        "m_50k":     bool(row[2]), "m_grad":   bool(row[3]),
+        "eta_2h":    bool(row[4]), "eta_1h":   bool(row[5]), "eta_30m": bool(row[6]),
+        "m_imminent": bool(row[7]),
     }
 
 
@@ -470,6 +477,40 @@ def _eta_minutes(mint: str, current_mcap: float) -> int:
     return max(1, int(remaining / velocity))
 
 
+def _velocity_trend(mint: str) -> tuple:
+    """
+    Returns (v_short, v_long) — velocity in USD/min over the last 5 min
+    and last 20 min respectively.
+    v_short > v_long * 1.3  → ACCELERATING (momentum building)
+    v_short < v_long * 0.6  → SLOWING (momentum fading)
+    Returns (-1, -1) when there is not enough data.
+    """
+    now = int(time.time())
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "SELECT mcap, ts FROM prelaunch_history WHERE mint=? AND ts > ? ORDER BY ts ASC",
+        (mint, now - 1500),   # last 25 minutes
+    )
+    rows = cur.fetchall()
+    con.close()
+
+    if len(rows) < 3:
+        return -1, -1
+
+    cutoff_5m = now - 300
+    recent = [(m, t) for m, t in rows if t >= cutoff_5m]
+    older  = [(m, t) for m, t in rows if t < cutoff_5m]
+
+    def _vel(pts):
+        if len(pts) < 2:
+            return -1.0
+        elapsed = max(pts[-1][1] - pts[0][1], 1) / 60.0
+        return (pts[-1][0] - pts[0][0]) / elapsed
+
+    return _vel(recent), _vel(older)
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Alert system
 # ──────────────────────────────────────────────────────────────────────────
@@ -591,6 +632,67 @@ def _check_token(t: dict):
                 + f"https://pump.fun/{mint}"
             )
 
+    # ── Imminent DEX launch — fires once when ETA drops under IMMINENT_ETA_MIN ──
+    if (mcap >= IMMINENT_MCAP_USD and 0 < eta <= IMMINENT_ETA_MIN
+            and not f.get("m_imminent")):
+        _mark(mint, "m_imminent")
+
+        v_short, v_long = _velocity_trend(mint)
+        if v_short > 0 and v_long > 0:
+            if v_short >= v_long * 1.3:
+                accel_tag = " ACCELERATING"
+            elif v_short < v_long * 0.6:
+                accel_tag = " SLOWING"
+            else:
+                accel_tag = ""
+            vel_line = f"Speed: +${v_short:.0f}/min{accel_tag}\n"
+        elif v_short > 0:
+            vel_line = f"Speed: +${v_short:.0f}/min\n"
+        else:
+            vel_line = ""
+
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+        cur.execute(
+            "SELECT launch_score, launch_tier, has_twitter, has_telegram, creator FROM prelaunch_tokens WHERE mint=?",
+            (mint,)
+        )
+        row = cur.fetchone()
+        con.close()
+        sc      = row[0] if row else 0
+        tier    = row[1] if row else "?"
+        twit    = "𝕏" if (row and row[2]) else ""
+        tele    = "✈️" if (row and row[3]) else ""
+        creator = row[4] if row and row[4] else ""
+        soc     = " ".join(filter(None, [twit, tele])) or "—"
+
+        cstats = get_creator_stats(creator) if creator else {}
+        ctier  = cstats.get("tier", "UNKNOWN")
+        creator_line = (
+            f"\nCreator: WINNER ({cstats.get('graduations',0)}/"
+            f"{cstats.get('total_launches',0)} grads)"
+            if ctier == "WINNER" else ""
+        )
+
+        pct    = min(mcap / GRADUATION_MCAP * 100, 100)
+        filled = int(pct / 10)
+        bar    = "#" * filled + "-" * (10 - filled)
+
+        sniper      = check_sniper_concentration(mint)
+        sniper_line = format_sniper_line(sniper)
+
+        _alert(
+            f"IMMINENT DEX LAUNCH — ~{eta}min to Raydium!\n\n"
+            f"{name} ({symbol.upper()})\n"
+            f"MCap: {_fmt(mcap)} | Age: {age_min}m\n"
+            f"[{bar}] {pct:.0f}% to graduation\n"
+            f"{vel_line}"
+            f"Score: {sc}/100 [{tier}] | Socials: {soc}"
+            + creator_line
+            + ("\n" + sniper_line if sniper_line else "")
+            + f"\n\nBuy NOW before DEX listing:\nhttps://pump.fun/{mint}"
+        )
+
     # ── ETA countdown alerts ──
     if eta > 0:
         if eta <= 30 and not f.get("eta_30m"):
@@ -622,26 +724,45 @@ def _check_token(t: dict):
 
 def monitor_loop():
     """
-    Priority-based monitor:
-      - Fresh tokens (< 15 min old) → checked every 30 seconds
-      - Veteran tokens (>= 15 min)  → checked every 2 minutes max
-    This ensures we catch tokens like Conviction at $5K not $19K.
+    Three-tier priority monitor:
+      - Critical tokens (MCap >= $35K, near graduation) → every 15 seconds
+      - Fresh tokens   (< 15 min old, MCap < $35K)     → every 30 seconds
+      - Veteran tokens (>= 15 min old, MCap < $35K)    → every 2 minutes
+
+    Critical tier is the key innovation: a token at $50K with 10 min ETA
+    is more time-sensitive than a brand-new token at $2K.
     """
     time.sleep(30)   # short initial wait
 
-    veteran_last_check: dict = {}   # mint → last check timestamp
+    veteran_last_check: dict  = {}   # mint → last check timestamp
+    critical_last_check: dict = {}   # mint → last check timestamp
 
     while True:
         try:
             now    = time.time()
             tokens = get_active_tokens()
 
+            critical = [t for t in tokens
+                        if t["last_mcap_usd"] >= IMMINENT_MCAP_USD]
             fresh    = [t for t in tokens
-                        if (now - t["detected_ts"]) / 60 < FRESH_TOKEN_MINUTES]
+                        if t["last_mcap_usd"] < IMMINENT_MCAP_USD
+                        and (now - t["detected_ts"]) / 60 < FRESH_TOKEN_MINUTES]
             veterans = [t for t in tokens
-                        if (now - t["detected_ts"]) / 60 >= FRESH_TOKEN_MINUTES]
+                        if t["last_mcap_usd"] < IMMINENT_MCAP_USD
+                        and (now - t["detected_ts"]) / 60 >= FRESH_TOKEN_MINUTES]
 
-            # ── Fresh tokens: check every pass (every 30 s) ──
+            # ── Critical: check every 15 s regardless of age ──
+            for t in critical:
+                mint = t["mint"]
+                if now - critical_last_check.get(mint, 0) >= MONITOR_CRITICAL_SECS:
+                    critical_last_check[mint] = now
+                    try:
+                        _check_token(t)
+                    except Exception as e:
+                        print(f"[PRELAUNCH] Critical check error {mint[:8]}: {e}")
+                    time.sleep(0.2)
+
+            # ── Fresh: check every pass (every 30 s) ──
             for t in fresh:
                 try:
                     _check_token(t)
@@ -657,7 +778,7 @@ def monitor_loop():
                     try:
                         _check_token(t)
                     except Exception as e:
-                        print(f"[PRELAUNCH] Check error {t['mint'][:8]}: {e}")
+                        print(f"[PRELAUNCH] Check error {mint[:8]}: {e}")
                     time.sleep(0.5)
 
         except Exception as e:
@@ -1303,6 +1424,48 @@ def get_hot_preorders(max_age_minutes: int = 120, min_velocity: float = 40) -> l
     # Fastest growing first
     result.sort(key=lambda x: x["velocity_usd_m"], reverse=True)
     return result
+
+
+def format_imminent() -> str:
+    """Format the /imminent command — tokens minutes away from DEX listing."""
+    tokens = get_approaching_tokens(max_eta_hours=0.5)   # ETA < 30 min
+
+    if not tokens:
+        return (
+            "Imminent DEX Launches\n\n"
+            "No tokens within 30 minutes of graduation right now.\n\n"
+            "Tokens appear here when their bonding curve velocity puts them\n"
+            "< 30 min from the $69K Raydium listing threshold.\n"
+            "Check /upcoming for tokens within 6 hours."
+        )
+
+    lines = [f"Imminent DEX Launches — {len(tokens)} token(s)\n"]
+    for i, t in enumerate(tokens[:6], 1):
+        eta    = t["eta_minutes"]
+        pct    = t["progress_pct"]
+        filled = int(pct / 10)
+        bar    = "#" * filled + "-" * (10 - filled)
+        vel    = t["velocity_usd_m"]
+        age_min = int((time.time() - t["detected_ts"]) / 60)
+
+        v_short, v_long = _velocity_trend(t["mint"])
+        if v_short > 0 and v_long > 0 and v_short >= v_long * 1.3:
+            accel = " ACCELERATING"
+        elif v_short > 0 and v_long > 0 and v_short < v_long * 0.6:
+            accel = " SLOWING"
+        else:
+            accel = ""
+
+        lines.append(
+            f"{i}. {t['name']} ({t['symbol'].upper()})\n"
+            f"   MCap: {_fmt(t['last_mcap_usd'])} | ETA: ~{eta}min | Age: {age_min}m\n"
+            f"   Speed: +${vel:.0f}/min{accel}\n"
+            f"   [{bar}] {pct:.0f}% to DEX\n"
+            f"   Buy: https://pump.fun/{t['mint']}\n"
+        )
+
+    lines.append("Buy on pump.fun BEFORE listing — price pumps at graduation!")
+    return "\n".join(lines)
 
 
 def format_preorder_list() -> str:

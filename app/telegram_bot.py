@@ -30,7 +30,7 @@ from app.portfolio import init_portfolio_table, add_holding, remove_holding, get
 from app.prelaunch_tracker import (
     init_prelaunch_tables, start_listener, register_callback,
     format_prelaunch_list, format_upcoming, format_preorder_list,
-    format_stats,
+    format_imminent, format_stats,
 )
 
 # -----------------------------
@@ -359,6 +359,7 @@ def send_menu(chat_id: int) -> None:
             [{"text": "/watchlist"}, {"text": "/refresh"}, {"text": "/settings"}],
             [{"text": "/paper_positions"}, {"text": "/paper_stats"}],
             [{"text": "/port"}, {"text": "/myalerts"}, {"text": "/help"}],
+            [{"text": "/imminent"}, {"text": "/preorder"}, {"text": "/upcoming"}],
         ],
         "resize_keyboard": True,
         "one_time_keyboard": False,
@@ -557,6 +558,7 @@ def help_text() -> str:
         "/newgems - scan for new gem launches\n"
         "/gems_on - enable gem alerts\n"
         "/gems_off - disable gem alerts\n"
+        "/imminent - tokens < 30 min from DEX graduation RIGHT NOW\n"
         "/preorder - HOT fresh tokens < 2h old, growing fast\n"
         "/upcoming - tokens approaching DEX graduation (with ETA)\n"
         "/prelaunch - all detected pre-launch tokens (last 6h)\n"
@@ -1491,6 +1493,10 @@ def main():
                             send_message(chat_id, f"Removed {sym} from portfolio." if ok else f"{sym} not in portfolio.")
                     else:
                         send_message(chat_id, "Portfolio commands:\n/port - show\n/port add BTC 0.5 95000\n/port remove BTC")
+
+                elif text == "/imminent":
+                    send_message(chat_id, "Scanning for tokens about to hit DEX...")
+                    send_message(chat_id, format_imminent())
 
                 elif text == "/prelaunch":
                     send_message(chat_id, format_prelaunch_list())
