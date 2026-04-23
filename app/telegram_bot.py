@@ -354,14 +354,18 @@ def send_message(chat_id: int, text: str) -> None:
 def send_menu(chat_id: int) -> None:
     keyboard = {
         "keyboard": [
+            # Pump.fun radar — most valuable, top of menu
+            [{"text": "/rising"},   {"text": "/gradzone"}, {"text": "/imminent"}],
+            [{"text": "/preorder"}, {"text": "/upcoming"}, {"text": "/prelaunch"}],
+            # Market analysis
             [{"text": "/overall"}, {"text": "/momentum"}, {"text": "/safer"}],
-            [{"text": "/scan"}, {"text": "/alerts"}, {"text": "/newgems"}],
             [{"text": "/feargreed"}, {"text": "/trending"}, {"text": "/report"}],
-            [{"text": "/watchlist"}, {"text": "/refresh"}, {"text": "/settings"}],
+            # Portfolio & alerts
+            [{"text": "/port"}, {"text": "/myalerts"}, {"text": "/watchlist"}],
             [{"text": "/paper_positions"}, {"text": "/paper_stats"}],
-            [{"text": "/port"}, {"text": "/myalerts"}, {"text": "/help"}],
-            [{"text": "/gradzone"}, {"text": "/imminent"}, {"text": "/rising"}],
-            [{"text": "/preorder"}],
+            # Utilities
+            [{"text": "/scan"}, {"text": "/refresh"}, {"text": "/settings"}],
+            [{"text": "/stats"}, {"text": "/help"}],
         ],
         "resize_keyboard": True,
         "one_time_keyboard": False,
@@ -371,7 +375,7 @@ def send_menu(chat_id: int) -> None:
         f"{BASE}/sendMessage",
         json={
             "chat_id": chat_id,
-            "text": "Menu ready. Use commands below or type /help for full list.",
+            "text": "Pump.fun Radar is live. Use the menu or /help for all commands.",
             "reply_markup": keyboard,
         },
         timeout=20,
@@ -517,58 +521,78 @@ def format_alerts(data: dict, limit: int = 5) -> str:
 
 def help_text() -> str:
     return (
-        "Crypto Bot Help\n\n"
-        "--- Market Analysis ---\n"
-        "/overall - top overall coins\n"
-        "/momentum - top momentum coins\n"
-        "/safer - safer coins\n"
-        "/scan - mixed signal scan\n"
-        "/alerts - top alert candidates\n"
-        "/refresh - refresh cache\n\n"
-        "--- Brain / AI ---\n"
-        "/brain BTC - full AI brain analysis\n"
-        "/braintop - top 10 coins by brain score\n"
-        "/compare BTC ETH - side-by-side comparison\n"
-        "/news BTC - latest news + sentiment\n"
-        "/social BTC - Reddit mentions + sentiment\n"
-        "/whales BTC - whale & volume activity\n"
-        "/funding BTC - Binance funding rates\n"
-        "/feargreed - crypto fear & greed index\n"
-        "/trending - coins consistently in scans\n"
-        "/report - full market report now\n\n"
-        "--- Price Alerts ---\n"
-        "/setalert BTC 100000 - alert when BTC hits price\n"
-        "/myalerts - list your active price alerts\n"
-        "/delalert 3 - remove alert by ID\n\n"
-        "--- Portfolio ---\n"
-        "/port - show portfolio P&L\n"
-        "/port add BTC 0.5 95000 - add holding\n"
-        "/port remove BTC - remove holding\n\n"
-        "--- Watchlist & Alerts ---\n"
-        "/watch BTC - add to watchlist\n"
-        "/unwatch BTC - remove from watchlist\n"
-        "/watchlist - show your watchlist\n"
-        "/alerts_on - enable alerts\n"
-        "/alerts_off - disable alerts\n"
-        "/setscore 0.60 - set minimum alert score\n\n"
-        "--- Paper Trading ---\n"
-        "/paper_open TAO 10 - open paper position\n"
-        "/paper_close TAO - close paper position\n"
-        "/paper_positions - show open trades\n"
-        "/paper_stats - trading stats\n\n"
-        "--- Gems ---\n"
-        "/newgems - scan for new gem launches\n"
-        "/gems_on - enable gem alerts\n"
-        "/gems_off - disable gem alerts\n"
-        "/gradzone - live scan of all tokens in the $30K-$65K graduation zone\n"
-        "/imminent - tokens < 30 min from DEX graduation RIGHT NOW\n"
-        "/rising - pre-zone radar: tokens $8K-$30K with strong buying velocity\n"
-        "/preorder - HOT fresh tokens < 2h old, growing fast\n"
-        "/upcoming - tokens approaching DEX graduation (with ETA)\n"
-        "/prelaunch - all detected pre-launch tokens (last 6h)\n"
-        "/stats - AI performance: tier win rates, top creators\n\n"
-        "/settings - your current settings\n"
-        "/start - restart bot\n"
+        "============================\n"
+        "   CRYPTO AI BOT — COMMANDS\n"
+        "============================\n\n"
+
+        "PUMP.FUN RADAR\n"
+        "--------------\n"
+        "/rising    — Pre-zone radar: $8K-$30K tokens with strong buy velocity\n"
+        "/gradzone  — Graduation zone: $30K-$65K tokens actively being bought\n"
+        "/imminent  — Tokens within ~20 min of DEX listing on Raydium\n"
+        "/preorder  — HOT tokens < 2h old and growing fast\n"
+        "/upcoming  — Approaching DEX graduation, with ETA\n"
+        "/prelaunch — All watched tokens in the last 6 hours\n"
+        "/stats     — AI win rates, top creators, tier performance\n\n"
+
+        "MARKET ANALYSIS\n"
+        "---------------\n"
+        "/overall   — Top overall coins right now\n"
+        "/momentum  — Top momentum coins\n"
+        "/safer     — Lower-risk coin picks\n"
+        "/scan      — Mixed signal scan\n"
+        "/alerts    — Top alert candidates\n"
+        "/refresh   — Refresh market cache\n\n"
+
+        "AI BRAIN\n"
+        "--------\n"
+        "/brain BTC        — Full AI analysis for a coin\n"
+        "/braintop         — Top 10 coins by brain score\n"
+        "/compare BTC ETH  — Side-by-side comparison\n"
+        "/news BTC         — News + sentiment\n"
+        "/social BTC       — Reddit mentions + sentiment\n"
+        "/whales BTC       — Whale & volume activity\n"
+        "/funding BTC      — Binance funding rates\n"
+        "/feargreed        — Fear & greed index\n"
+        "/trending         — Coins consistently appearing in scans\n"
+        "/report           — Full market report\n\n"
+
+        "PRICE ALERTS\n"
+        "------------\n"
+        "/setalert BTC 100000  — Alert when BTC hits a price\n"
+        "/myalerts             — List your active alerts\n"
+        "/delalert 3           — Delete alert by ID\n\n"
+
+        "PORTFOLIO\n"
+        "---------\n"
+        "/port                      — Show P&L\n"
+        "/port add BTC 0.5 95000    — Add a holding\n"
+        "/port remove BTC           — Remove a holding\n\n"
+
+        "WATCHLIST\n"
+        "---------\n"
+        "/watch BTC      — Add coin to watchlist\n"
+        "/unwatch BTC    — Remove from watchlist\n"
+        "/watchlist      — Show your watchlist\n"
+        "/alerts_on      — Enable market alerts\n"
+        "/alerts_off     — Disable market alerts\n"
+        "/gems_on        — Enable gem launch alerts\n"
+        "/gems_off       — Disable gem launch alerts\n"
+        "/setscore 0.60  — Set minimum alert score\n\n"
+
+        "PAPER TRADING\n"
+        "-------------\n"
+        "/paper_open TAO 10   — Open a paper trade ($10)\n"
+        "/paper_close TAO     — Close a paper trade\n"
+        "/paper_positions     — View open trades\n"
+        "/paper_stats         — Trading performance\n\n"
+
+        "SETTINGS\n"
+        "--------\n"
+        "/settings  — View your current settings\n"
+        "/start     — Reopen the main menu\n\n"
+
+        "Tip: tap /start any time to bring back the quick-access menu."
     )
 
 
