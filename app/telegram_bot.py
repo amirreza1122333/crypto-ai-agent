@@ -30,7 +30,7 @@ from app.portfolio import init_portfolio_table, add_holding, remove_holding, get
 from app.prelaunch_tracker import (
     init_prelaunch_tables, start_listener, register_callback,
     format_prelaunch_list, format_upcoming, format_preorder_list,
-    format_imminent, format_stats,
+    format_imminent, format_rising, format_stats,
     _fetch_graduation_zone, _fmt as _pfmt, GRADUATION_MCAP,
 )
 
@@ -360,7 +360,8 @@ def send_menu(chat_id: int) -> None:
             [{"text": "/watchlist"}, {"text": "/refresh"}, {"text": "/settings"}],
             [{"text": "/paper_positions"}, {"text": "/paper_stats"}],
             [{"text": "/port"}, {"text": "/myalerts"}, {"text": "/help"}],
-            [{"text": "/gradzone"}, {"text": "/imminent"}, {"text": "/preorder"}],
+            [{"text": "/gradzone"}, {"text": "/imminent"}, {"text": "/rising"}],
+            [{"text": "/preorder"}],
         ],
         "resize_keyboard": True,
         "one_time_keyboard": False,
@@ -561,6 +562,7 @@ def help_text() -> str:
         "/gems_off - disable gem alerts\n"
         "/gradzone - live scan of all tokens in the $30K-$65K graduation zone\n"
         "/imminent - tokens < 30 min from DEX graduation RIGHT NOW\n"
+        "/rising - pre-zone radar: tokens $8K-$30K with strong buying velocity\n"
         "/preorder - HOT fresh tokens < 2h old, growing fast\n"
         "/upcoming - tokens approaching DEX graduation (with ETA)\n"
         "/prelaunch - all detected pre-launch tokens (last 6h)\n"
@@ -1533,6 +1535,10 @@ def main():
                 elif text == "/imminent":
                     send_message(chat_id, "Scanning for tokens about to hit DEX...")
                     send_message(chat_id, format_imminent())
+
+                elif text == "/rising":
+                    send_message(chat_id, "Scanning pre-zone tokens with buying velocity...")
+                    send_message(chat_id, format_rising())
 
                 elif text == "/prelaunch":
                     send_message(chat_id, format_prelaunch_list())

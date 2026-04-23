@@ -65,6 +65,12 @@ IMMINENT_MCAP_USD     = 35_000  # start "critical" tracking above $35K (~54% to 
 IMMINENT_ETA_MIN      = 20      # fire imminent alert when ETA drops below 20 min
 NEAR_GRAD_MCAP        = 50_000  # $50K = 77% to graduation — alert even without ETA data
 
+# Pre-graduation zone ("Rising Stars") — tokens building momentum before $30K
+PRE_ZONE_MIN_MCAP     = 8_000   # start watching velocity here
+PRE_ZONE_MAX_MCAP     = 30_000  # upper bound (graduation zone begins)
+PRE_ZONE_ALERT_VEL    = 300     # minimum USD/min to fire a rising-star alert
+ACTIVE_TRADE_WINDOW   = 600     # token must have traded in last 10 min to show in gradzone
+
 # Graduation zone scanner — polls pump.fun API for tokens already mid-flight
 GRAD_ZONE_POLL_SECS   = 60      # scan every 60 seconds
 GRAD_ZONE_MIN_MCAP    = 30_000  # lower bound of zone
@@ -171,6 +177,8 @@ def init_prelaunch_tables():
         ("m_5k",             "INTEGER DEFAULT 0"),
         # Fired once when token is < IMMINENT_ETA_MIN minutes from graduation.
         ("m_imminent",       "INTEGER DEFAULT 0"),
+        # Fired once when token in $8K-$30K shows velocity >= PRE_ZONE_ALERT_VEL.
+        ("m_rising",         "INTEGER DEFAULT 0"),
     ]
     for col, typedef in new_cols:
         try:
@@ -337,7 +345,7 @@ def _flags(mint) -> dict:
     cur.execute("""
         SELECT m_5k, m_30k, m_50k, m_grad,
                COALESCE(eta_2h,0), COALESCE(eta_1h,0), COALESCE(eta_30m,0),
-               COALESCE(m_imminent,0)
+               COALESCE(m_imminent,0), COALESCE(m_rising,0)
         FROM prelaunch_tokens WHERE mint=?
     """, (mint,))
     row = cur.fetchone()
@@ -348,7 +356,7 @@ def _flags(mint) -> dict:
         "m_5k":      bool(row[0]), "m_30k":    bool(row[1]),
         "m_50k":     bool(row[2]), "m_grad":   bool(row[3]),
         "eta_2h":    bool(row[4]), "eta_1h":   bool(row[5]), "eta_30m": bool(row[6]),
-        "m_imminent": bool(row[7]),
+        "m_imminent": bool(row[7]), "m_rising": bool(row[8]),
     }
 
 
@@ -637,6 +645,51 @@ def _check_token(t: dict):
                 f"Score: {sc}/100 [{tier}] | Socials: {soc}\n"
                 + (sniper_line + "\n" if sniper_line else "")
                 + f"https://pump.fun/{mint}"
+            )
+
+    # ── Rising Star — pre-graduation zone with strong velocity ──
+    if (PRE_ZONE_MIN_MCAP <= mcap < PRE_ZONE_MAX_MCAP and not f.get("m_rising")):
+        v_short, v_long = _velocity_trend(mint)
+        if v_short >= PRE_ZONE_ALERT_VEL:
+            _mark(mint, "m_rising")
+
+            if v_short > 0 and v_long > 0 and v_short >= v_long * 1.3:
+                accel_tag = " ACCELERATING"
+            elif v_short > 0 and v_long > 0 and v_short < v_long * 0.6:
+                accel_tag = " SLOWING"
+            else:
+                accel_tag = ""
+
+            mins_to_zone = int((PRE_ZONE_MAX_MCAP - mcap) / v_short) if v_short > 0 else -1
+            eta_zone = f"~{mins_to_zone}min to graduation zone" if mins_to_zone > 0 else ""
+
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            cur.execute(
+                "SELECT launch_score, launch_tier, has_twitter, has_telegram FROM prelaunch_tokens WHERE mint=?",
+                (mint,)
+            )
+            row = cur.fetchone()
+            con.close()
+            sc   = row[0] if row else 0
+            tier = row[1] if row else "?"
+            twit = "𝕏" if (row and row[2]) else ""
+            tele = "✈️" if (row and row[3]) else ""
+            soc  = " ".join(filter(None, [twit, tele])) or "—"
+
+            pct    = min(mcap / GRADUATION_MCAP * 100, 100)
+            filled = int(pct / 10)
+            bar    = "#" * filled + "-" * (10 - filled)
+
+            _alert(
+                f"RISING STAR — Building momentum!\n\n"
+                f"{name} ({symbol.upper()})\n"
+                f"MCap: {_fmt(mcap)} | Age: {age_min}m\n"
+                f"[{bar}] {pct:.0f}% to DEX\n"
+                f"Speed: +${v_short:.0f}/min{accel_tag}\n"
+                f"{eta_zone}\n"
+                f"Score: {sc}/100 [{tier}] | Socials: {soc}\n\n"
+                f"Buy early on pump.fun:\nhttps://pump.fun/{mint}"
             )
 
     # ── Imminent DEX launch — fires on ETA threshold OR MCap proximity ──
@@ -1490,8 +1543,8 @@ async def _trade_feed_listen():
                             # Update MCap for tokens we already track
                             if mcap_usd > 0:
                                 _update(mint, mcap_usd)
-                        elif GRAD_ZONE_MIN_MCAP <= mcap_usd < GRAD_ZONE_MAX_MCAP:
-                            # Unknown token in graduation zone — discover it
+                        elif mcap_usd >= PRE_ZONE_MIN_MCAP:
+                            # Unknown token in pre-zone or graduation zone — discover it
                             asyncio.ensure_future(_ingest_trade_token(mint, mcap_usd, sol))
 
                     except Exception as e:
@@ -1502,14 +1555,34 @@ async def _trade_feed_listen():
             await asyncio.sleep(5)
 
 
-def _fetch_graduation_zone() -> list:
-    """
-    Return currently tracked tokens in the graduation zone for /gradzone command.
-    Uses our own DB (populated by the trade feed) — no external API needed.
-    """
+def _has_recent_trade(mint: str, window_secs: int = ACTIVE_TRADE_WINDOW) -> tuple:
+    """Returns (is_active, velocity_usd_per_min) based on recent history."""
+    cutoff = int(time.time()) - window_secs
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
-    cutoff = int(time.time()) - TRACK_HOURS * 3600
+    cur.execute(
+        "SELECT mcap, ts FROM prelaunch_history WHERE mint=? AND ts > ? ORDER BY ts ASC",
+        (mint, cutoff)
+    )
+    rows = cur.fetchall()
+    con.close()
+    if len(rows) < 2:
+        return False, 0.0
+    elapsed = max(rows[-1][1] - rows[0][1], 1) / 60.0
+    vel = (rows[-1][0] - rows[0][0]) / elapsed
+    return vel > 0, vel
+
+
+def _fetch_graduation_zone() -> list:
+    """
+    Return currently tracked tokens in the graduation zone ($30K-$65K)
+    that have ACTIVE buying in the last 10 minutes and positive velocity.
+    Dead/stalled tokens are excluded.
+    """
+    now    = int(time.time())
+    cutoff = now - TRACK_HOURS * 3600
+    con    = sqlite3.connect(DB_PATH)
+    cur    = con.cursor()
     cur.execute("""
         SELECT mint, name, symbol, last_mcap_usd, has_twitter, has_telegram,
                launch_score, launch_tier, detected_ts
@@ -1521,16 +1594,97 @@ def _fetch_graduation_zone() -> list:
     """, (GRAD_ZONE_MIN_MCAP, GRAD_ZONE_MAX_MCAP, cutoff))
     rows = cur.fetchall()
     con.close()
-    return [
-        {
-            "mint":         r[0], "name":       r[1], "symbol":      r[2],
-            "usd_market_cap": r[3],
-            "twitter":      r[4], "telegram":   r[5],
-            "launch_score": r[6], "launch_tier": r[7],
-            "detected_ts":  r[8],
-        }
-        for r in rows
-    ]
+
+    result = []
+    for r in rows:
+        is_active, vel = _has_recent_trade(r[0])
+        if not is_active:
+            continue     # dead token — skip
+        result.append({
+            "mint":           r[0], "name":        r[1], "symbol":      r[2],
+            "usd_market_cap": r[3], "twitter":     r[4], "telegram":    r[5],
+            "launch_score":   r[6], "launch_tier": r[7], "detected_ts": r[8],
+            "velocity":       vel,
+        })
+    result.sort(key=lambda x: x["velocity"], reverse=True)
+    return result
+
+
+def _fetch_pre_zone() -> list:
+    """
+    Tokens in $8K-$30K with positive velocity — approaching the graduation zone.
+    Used by /rising command.
+    """
+    now    = int(time.time())
+    cutoff = now - TRACK_HOURS * 3600
+    con    = sqlite3.connect(DB_PATH)
+    cur    = con.cursor()
+    cur.execute("""
+        SELECT mint, name, symbol, last_mcap_usd, has_twitter, has_telegram,
+               launch_score, launch_tier, detected_ts
+        FROM prelaunch_tokens
+        WHERE last_mcap_usd >= ? AND last_mcap_usd < ?
+          AND graduated = 0
+          AND detected_ts > ?
+        ORDER BY last_mcap_usd DESC
+    """, (PRE_ZONE_MIN_MCAP, PRE_ZONE_MAX_MCAP, cutoff))
+    rows = cur.fetchall()
+    con.close()
+
+    result = []
+    for r in rows:
+        is_active, vel = _has_recent_trade(r[0])
+        if not is_active or vel < 50:   # must be moving, at least $50/min
+            continue
+        mins_to_zone = int((PRE_ZONE_MAX_MCAP - r[3]) / vel) if vel > 0 else -1
+        result.append({
+            "mint":           r[0], "name":        r[1], "symbol":      r[2],
+            "usd_market_cap": r[3], "twitter":     r[4], "telegram":    r[5],
+            "launch_score":   r[6], "launch_tier": r[7], "detected_ts": r[8],
+            "velocity":       vel,
+            "mins_to_zone":   mins_to_zone,
+        })
+    result.sort(key=lambda x: x["velocity"], reverse=True)
+    return result
+
+
+def format_rising() -> str:
+    """Format /rising — tokens in $8K-$30K with velocity, approaching graduation zone."""
+    tokens = _fetch_pre_zone()
+
+    if not tokens:
+        return (
+            "Rising Stars — Pre-Graduation Zone\n\n"
+            "No actively rising tokens in the $8K-$30K range right now.\n\n"
+            "Tokens appear here when they show consistent buying momentum\n"
+            "before reaching the graduation zone. Check /gradzone for\n"
+            "tokens already in the $30K-$65K range."
+        )
+
+    lines = [f"Rising Stars — {len(tokens)} token(s) heading toward graduation\n"]
+    for i, t in enumerate(tokens[:8], 1):
+        mcap    = t["usd_market_cap"]
+        vel     = t["velocity"]
+        pct     = min(mcap / GRADUATION_MCAP * 100, 100)
+        filled  = int(pct / 10)
+        bar     = "#" * filled + "-" * (10 - filled)
+        age_min = int((time.time() - t["detected_ts"]) / 60)
+        tw      = "𝕏" if t["twitter"] else ""
+        tg      = "✈️" if t["telegram"] else ""
+        soc     = " ".join(filter(None, [tw, tg])) or "—"
+        eta_str = f"~{t['mins_to_zone']}min to grad zone" if t["mins_to_zone"] > 0 else ""
+
+        lines.append(
+            f"{i}. {t['name']} ({t['symbol'].upper()})\n"
+            f"   MCap: {_fmt(mcap)} | Age: {age_min}m\n"
+            f"   [{bar}] {pct:.0f}% | Speed: +${vel:.0f}/min\n"
+            f"   {eta_str}\n"
+            f"   Score: {t['launch_score']}/100 [{t['launch_tier']}] | Socials: {soc}\n"
+            f"   https://pump.fun/{t['mint']}\n"
+        )
+
+    lines.append("Buy EARLY — these are approaching the $30K-$65K graduation zone.")
+    return "\n".join(lines)
 
 
 def graduation_zone_loop():
