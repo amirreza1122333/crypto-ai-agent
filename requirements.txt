@@ -12,4 +12,4 @@ scikit-learn>=1.5.0
 joblib>=1.4.0
 websockets>=12.0
 xgboost>=2.0.0
-anthropic>=0.40.0
+groq>=0.9.0
