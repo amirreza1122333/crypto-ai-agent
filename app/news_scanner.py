@@ -2,6 +2,8 @@ import time
 import requests
 import urllib3
 
+from app.claude_ai import analyze_news
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 CRYPTOPANIC_URL = "https://cryptopanic.com/api/free/v1/posts/"
@@ -58,6 +60,12 @@ def _parse_posts(posts: list) -> dict:
                 d["sentiment"] = "bullish"
             elif n > p * 1.5:
                 d["sentiment"] = "bearish"
+
+        # Upgrade vote-based sentiment with Claude LLM analysis when headlines exist
+        if d["headlines"]:
+            llm_sent = analyze_news(code, d["headlines"])
+            if llm_sent:
+                d["sentiment"] = llm_sent
 
     return news_by_coin
 

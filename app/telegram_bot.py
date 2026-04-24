@@ -33,6 +33,7 @@ from app.prelaunch_tracker import (
     format_imminent, format_rising, format_stats,
     _fetch_graduation_zone, _fmt as _pfmt, GRADUATION_MCAP,
 )
+from app.claude_ai import chat as ai_chat, reset_chat as ai_reset_chat
 
 # -----------------------------
 # Load ENV
@@ -1578,8 +1579,35 @@ def main():
                 elif text == "/stats":
                     send_message(chat_id, format_stats())
 
-                else:
+                elif text in ("/aichat", "/resetchat"):
+                    ai_reset_chat(chat_id)
+                    send_message(chat_id, "AI chat history cleared. Ask me anything about crypto!")
+
+                elif text.startswith("/"):
                     send_message(chat_id, f"Unknown command: {text}\nType /help for all commands.")
+
+                else:
+                    # Free-form chat — route to Claude AI
+                    try:
+                        # Build scan context for Claude
+                        ctx: dict = {}
+                        try:
+                            scan_data = api("/scan?limit=20")
+                            ctx["coins"] = scan_data.get("results", [])
+                        except Exception:
+                            pass
+                        try:
+                            from app.fear_greed import get_fear_greed
+                            fg = get_fear_greed()
+                            ctx["fear_greed"] = fg.get("value")
+                        except Exception:
+                            pass
+
+                        send_message(chat_id, "Thinking...")
+                        reply = ai_chat(chat_id, text, context=ctx)
+                        send_message(chat_id, reply)
+                    except Exception as e:
+                        send_message(chat_id, f"AI error: {e}")
 
         except Exception as e:
             print("ERROR:", e)

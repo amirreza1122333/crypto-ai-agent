@@ -1,5 +1,7 @@
 import pandas as pd
 
+from app.claude_ai import analyze_coin
+
 
 def _describe_24h(change_24h: float) -> str:
     if change_24h >= 15:
@@ -45,7 +47,7 @@ def _describe_rank(rank: float) -> str:
     return "Smaller-cap profile"
 
 
-def build_explanation(row: pd.Series) -> str:
+def _rule_based(row: pd.Series) -> str:
     parts = [
         _describe_7d(row["price_change_percentage_7d_in_currency"]),
         _describe_24h(row["price_change_percentage_24h"]),
@@ -54,6 +56,13 @@ def build_explanation(row: pd.Series) -> str:
         f'Classified as {row["risk_level"]} risk / {row["bucket"]}',
     ]
     return " | ".join(parts)
+
+
+def build_explanation(row: pd.Series) -> str:
+    ai_text = analyze_coin(row.to_dict())
+    if ai_text:
+        return ai_text
+    return _rule_based(row)
 
 
 def add_explanations(df: pd.DataFrame) -> pd.DataFrame:
