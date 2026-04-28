@@ -126,8 +126,17 @@ def predict_live_top(n: int = 10):
     df = enrich_level3(df)
     df = build_live_features(df)
 
-    for col in feature_names:
-        if col not in df.columns:
+    # Drift guard: if the model expects features that the live pipeline never
+    # produced, the zero-fill below silently feeds the model garbage. Warn
+    # loudly so a stale model file is obvious rather than mysterious.
+    missing = [c for c in feature_names if c not in df.columns]
+    if missing:
+        print(
+            f"[PREDICT] WARNING: model expects {len(missing)} feature(s) "
+            f"that the live pipeline did not produce — zero-filling: {missing}. "
+            "Retrain after changing feature definitions."
+        )
+        for col in missing:
             df[col] = 0.0
 
     X = df[feature_names].copy().fillna(0)

@@ -15,7 +15,9 @@ def ensure_models_dir():
 def save_model(model, feature_names):
     ensure_models_dir()
     joblib.dump(model, MODEL_PATH)
-    joblib.dump(feature_names, FEATURES_PATH)
+    joblib.dump(list(feature_names), FEATURES_PATH)
+    print(f"[MODEL] Saved {len(feature_names)} features to {FEATURES_PATH.name}")
+    print(f"[MODEL] Features: {list(feature_names)}")
 
 
 def load_model():
