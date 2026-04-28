@@ -26,6 +26,8 @@ import urllib3
 from pathlib import Path
 from dotenv import load_dotenv
 
+from app.config import SSL_VERIFY
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
@@ -408,7 +410,7 @@ def _sol_price() -> float:
         r = requests.get(
             "https://api.coingecko.com/api/v3/simple/price",
             params={"ids": "solana", "vs_currencies": "usd"},
-            timeout=6, verify=False,
+            timeout=6, verify=SSL_VERIFY,
         )
         if r.status_code == 200:
             return float(r.json().get("solana", {}).get("usd", 150))
@@ -437,7 +439,7 @@ def _fetch_mcap(mint: str) -> float:
         r = requests.get(
             f"https://frontend-api.pump.fun/coins/{mint}",
             headers={"User-Agent": "Mozilla/5.0", "Referer": "https://pump.fun/"},
-            timeout=8, verify=False,
+            timeout=8, verify=SSL_VERIFY,
         )
         if r.status_code == 200:
             v = float(r.json().get("usd_market_cap", 0) or 0)
@@ -451,7 +453,7 @@ def _fetch_mcap(mint: str) -> float:
         r = requests.get(
             f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{mint}",
             headers={"Accept": "application/json;version=20230302"},
-            timeout=8, verify=False,
+            timeout=8, verify=SSL_VERIFY,
         )
         if r.status_code == 200:
             a = r.json().get("data", {}).get("attributes", {})
@@ -520,8 +522,12 @@ def _velocity_trend(mint: str) -> tuple:
     def _vel(pts):
         if len(pts) < 2:
             return -1.0
-        elapsed = max(pts[-1][1] - pts[0][1], 1) / 60.0
-        return (pts[-1][0] - pts[0][0]) / elapsed
+        elapsed_secs = pts[-1][1] - pts[0][1]
+        # Sub-minute spacing makes per-minute velocity meaningless and
+        # prone to wild over-reporting when timestamps collide.
+        if elapsed_secs < 60:
+            return -1.0
+        return (pts[-1][0] - pts[0][0]) / (elapsed_secs / 60.0)
 
     return _vel(recent), _vel(older)
 
@@ -1258,7 +1264,7 @@ async def _ws_listen():
                                         f"https://frontend-api.pump.fun/coins/{m}",
                                         headers={"User-Agent": "Mozilla/5.0",
                                                  "Referer": "https://pump.fun/"},
-                                        timeout=5, verify=False,
+                                        timeout=5, verify=SSL_VERIFY,
                                     )
                                 ),
                                 timeout=6,
@@ -1436,7 +1442,7 @@ async def _fetch_token_metadata(mint: str) -> dict:
                 lambda: requests.get(
                     f"https://frontend-api.pump.fun/coins/{mint}",
                     headers={"User-Agent": "Mozilla/5.0", "Referer": "https://pump.fun/"},
-                    timeout=6, verify=False,
+                    timeout=6, verify=SSL_VERIFY,
                 )
             ),
             timeout=8,
@@ -1446,6 +1452,16 @@ async def _fetch_token_metadata(mint: str) -> dict:
     except Exception:
         pass
     return {}
+
+
+def _log_ingest_failure(task: "asyncio.Task") -> None:
+    """Surface exceptions from fire-and-forget _ingest_trade_token tasks."""
+    try:
+        exc = task.exception()
+    except (asyncio.CancelledError, asyncio.InvalidStateError):
+        return
+    if exc is not None:
+        print(f"[GRAD_ZONE] Background ingest task failed: {type(exc).__name__}: {exc}")
 
 
 async def _ingest_trade_token(mint: str, mcap_usd: float, sol_price: float) -> None:
@@ -1544,8 +1560,11 @@ async def _trade_feed_listen():
                             if mcap_usd > 0:
                                 _update(mint, mcap_usd)
                         elif mcap_usd >= PRE_ZONE_MIN_MCAP:
-                            # Unknown token in pre-zone or graduation zone — discover it
-                            asyncio.ensure_future(_ingest_trade_token(mint, mcap_usd, sol))
+                            # Unknown token in pre-zone or graduation zone — discover it.
+                            # Fire-and-forget but track failures so they don't vanish into
+                            # "Task exception was never retrieved" warnings at GC time.
+                            _task = asyncio.ensure_future(_ingest_trade_token(mint, mcap_usd, sol))
+                            _task.add_done_callback(_log_ingest_failure)
 
                     except Exception as e:
                         print(f"[GRAD_ZONE] Parse error: {e}")
@@ -1568,8 +1587,10 @@ def _has_recent_trade(mint: str, window_secs: int = ACTIVE_TRADE_WINDOW) -> tupl
     con.close()
     if len(rows) < 2:
         return False, 0.0
-    elapsed = max(rows[-1][1] - rows[0][1], 1) / 60.0
-    vel = (rows[-1][0] - rows[0][0]) / elapsed
+    elapsed_secs = rows[-1][1] - rows[0][1]
+    if elapsed_secs < 60:
+        return False, 0.0
+    vel = (rows[-1][0] - rows[0][0]) / (elapsed_secs / 60.0)
     return vel > 0, vel
 
 

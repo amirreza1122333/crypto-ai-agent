@@ -68,10 +68,6 @@ PRICE_ALERT_POLL        = 300   # check price alerts every 5 min
 BRAIN_ALERT_THRESHOLD   = 72    # brain score threshold for brain alerts
 DAILY_REPORT_HOUR_UTC   = 8     # send daily report at 8am UTC
 
-# In-memory set of alerted gem token addresses (address:chain)
-_alerted_gems: set = set()
-
-
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
