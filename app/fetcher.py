@@ -13,10 +13,12 @@ from app.config import (
     REQUEST_DELAY,
     MAX_RETRIES,
     BACKOFF_FACTOR,
+    SSL_VERIFY,
 )
 
-# SSL verification is disabled due to system-level certificate interception
-# (antivirus/VPN SSL inspection). Safe for local development only.
+# TLS verification is controlled by config.SSL_VERIFY (env: INSECURE_SSL).
+# Default is verify=True. Set INSECURE_SSL=true in .env if your dev network
+# inspects certs (e.g. corporate proxy / antivirus SSL inspection).
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 DEFAULT_HEADERS = {
@@ -143,7 +145,7 @@ def fetch_market_data() -> pd.DataFrame:
 
     session = requests.Session()
     session.headers.update(DEFAULT_HEADERS)
-    session.verify = False
+    session.verify = SSL_VERIFY
 
     df = _fetch_from_coingecko(session)
     if not df.empty:

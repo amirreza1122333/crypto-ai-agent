@@ -13,6 +13,8 @@ At 50 gems/day = ~1,500 credits/day = ~45,000/month
 import os
 import time
 import requests
+
+from app.config import SSL_VERIFY
 import urllib3
 from pathlib import Path
 from dotenv import load_dotenv
@@ -41,7 +43,7 @@ def _rpc(method: str, params: list):
         r = requests.post(
             HELIUS_RPC,
             json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
-            timeout=15, verify=False,
+            timeout=15, verify=SSL_VERIFY,
         )
         if r.status_code == 200:
             return r.json().get("result", {})
@@ -57,7 +59,7 @@ def _api_get(path: str, params: dict = None):
         r = requests.get(
             f"{HELIUS_API}/{path}",
             params={"api-key": HELIUS_API_KEY, **(params or {})},
-            timeout=15, verify=False,
+            timeout=15, verify=SSL_VERIFY,
         )
         if r.status_code == 200:
             return r.json()
@@ -74,7 +76,7 @@ def _api_post(path: str, body: dict):
             f"{HELIUS_API}/{path}",
             params={"api-key": HELIUS_API_KEY},
             json=body,
-            timeout=15, verify=False,
+            timeout=15, verify=SSL_VERIFY,
         )
         if r.status_code == 200:
             return r.json()

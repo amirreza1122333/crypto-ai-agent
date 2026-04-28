@@ -18,6 +18,8 @@ import requests
 import urllib3
 from datetime import datetime, timezone
 
+from app.config import SSL_VERIFY
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 GECKOTERMINAL_BASE = "https://api.geckoterminal.com/api/v2"
@@ -64,7 +66,7 @@ GEM_ALERT_SCORE     = 55      # lowered for faster alerts
 
 def _get(url, params=None, headers=None, timeout=12):
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=timeout, verify=False)
+        r = requests.get(url, params=params, headers=headers, timeout=timeout, verify=SSL_VERIFY)
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -75,7 +77,7 @@ def _get(url, params=None, headers=None, timeout=12):
 def _get_silent(url, params=None, headers=None, timeout=12):
     """Like _get but no error print."""
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=timeout, verify=False)
+        r = requests.get(url, params=params, headers=headers, timeout=timeout, verify=SSL_VERIFY)
         if r.status_code == 200:
             return r.json()
     except Exception:
@@ -256,7 +258,7 @@ def _get_pumpfun(url, params=None) -> list:
     for _ in range(2):
         try:
             r = requests.get(url, params=params, headers=BROWSER_HEADERS,
-                             timeout=12, verify=False)
+                             timeout=12, verify=SSL_VERIFY)
             if r.status_code == 200:
                 data = r.json()
                 if isinstance(data, list):

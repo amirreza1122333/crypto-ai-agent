@@ -3,6 +3,7 @@ import requests
 import urllib3
 
 from app.claude_ai import analyze_news
+from app.config import SSL_VERIFY
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -18,7 +19,7 @@ def _fetch_raw(symbol: str = None) -> list:
     if symbol:
         params["currencies"] = symbol.upper()
     try:
-        r = requests.get(CRYPTOPANIC_URL, params=params, timeout=10, verify=False)
+        r = requests.get(CRYPTOPANIC_URL, params=params, timeout=10, verify=SSL_VERIFY)
         r.raise_for_status()
         return r.json().get("results", [])
     except Exception as e:

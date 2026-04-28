@@ -6,6 +6,8 @@ import time
 import requests
 import urllib3
 
+from app.config import SSL_VERIFY
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 FUNDING_URL = "https://fapi.binance.com/fapi/v1/fundingRate"
@@ -22,7 +24,7 @@ def _get_funding_rate(pair: str) -> float:
             FUNDING_URL,
             params={"symbol": pair, "limit": 1},
             timeout=8,
-            verify=False,
+            verify=SSL_VERIFY,
         )
         if r.status_code == 200:
             data = r.json()
@@ -39,7 +41,7 @@ def _get_open_interest(pair: str) -> float:
             OI_URL,
             params={"symbol": pair},
             timeout=8,
-            verify=False,
+            verify=SSL_VERIFY,
         )
         if r.status_code == 200:
             return float(r.json().get("openInterest", 0))

@@ -17,3 +17,12 @@ MAX_RETRIES = int(os.getenv("MAX_RETRIES", 4))
 BACKOFF_FACTOR = float(os.getenv("BACKOFF_FACTOR", 2))
 
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+
+# TLS verification for outbound HTTP. Default secure. Set INSECURE_SSL=true
+# in .env only on dev networks where certs cannot be validated. Never enable
+# this in production — disables MITM protection on every requests.* call.
+INSECURE_SSL = os.getenv("INSECURE_SSL", "false").lower() in ("true", "1", "yes")
+SSL_VERIFY = not INSECURE_SSL
+
+if INSECURE_SSL:
+    print("[CONFIG] WARNING: INSECURE_SSL=true — TLS verification disabled for all HTTP calls.")

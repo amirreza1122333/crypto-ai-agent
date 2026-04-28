@@ -2,6 +2,8 @@ import time
 import requests
 import urllib3
 
+from app.config import SSL_VERIFY
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 FEAR_GREED_URL = "https://api.alternative.me/fng/"
@@ -22,7 +24,7 @@ def get_fear_greed() -> dict:
             FEAR_GREED_URL,
             params={"limit": 1},
             timeout=10,
-            verify=False,
+            verify=SSL_VERIFY,
         )
         data = r.json().get("data", [{}])[0]
         result = {

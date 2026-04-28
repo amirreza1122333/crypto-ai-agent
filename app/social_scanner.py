@@ -2,6 +2,8 @@ import time
 import requests
 import urllib3
 
+from app.config import SSL_VERIFY
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 CACHE_TTL = 1800  # 30 minutes
@@ -25,7 +27,7 @@ def _search_reddit(symbol: str, subreddit: str) -> list:
             headers=HEADERS,
             params={"q": symbol, "sort": "new", "limit": 10, "t": "day", "restrict_sr": "true"},
             timeout=8,
-            verify=False,
+            verify=SSL_VERIFY,
         )
         if r.status_code == 200:
             return r.json().get("data", {}).get("children", [])
