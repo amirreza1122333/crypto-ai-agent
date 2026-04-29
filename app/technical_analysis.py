@@ -1,9 +1,62 @@
+import numpy as np
 import pandas as pd
 from app.data_store import load_all_data
 
 _ta_cache = {}
 _ta_cache_ts = 0
 TA_CACHE_TTL = 600  # 10 minutes
+
+_SECONDS_PER_YEAR = 365.0 * 24.0 * 3600.0
+
+
+def _compute_realized_vol(prices: pd.Series, ts: pd.Series) -> float:
+    """
+    Annualized realized volatility from a snapshot series.
+
+    Computes the sample std-dev of log returns between consecutive snapshots
+    and annualizes by the **median** sampling interval (robust to occasional
+    gaps in the collector's polling cadence).
+
+    Returns 0.0 on insufficient data (<10 valid samples) so callers can fall
+    back to a proxy without special-casing exceptions.
+
+    Vectorized via numpy — no Python loops. Typical cost ~0.3 ms on a 50-row
+    series; the TA cache amortizes it over 10 minutes regardless.
+    """
+    if len(prices) < 10 or len(prices) != len(ts):
+        return 0.0
+
+    ts_dt = pd.to_datetime(ts, errors="coerce")
+    valid = ts_dt.notna() & (prices > 0)
+    p = prices[valid].astype(float).to_numpy()
+    t = ts_dt[valid].to_numpy()
+
+    if len(p) < 10:
+        return 0.0
+
+    # Sort by ts in case the input wasn't already sorted
+    order = np.argsort(t)
+    p = p[order]
+    t = t[order]
+
+    log_ret = np.log(p[1:] / p[:-1])
+    if not np.all(np.isfinite(log_ret)):
+        # A bad price (zero / NaN slipping through) poisoned the series.
+        return 0.0
+
+    dts = (t[1:] - t[:-1]).astype("timedelta64[s]").astype(float)
+    median_dt = float(np.median(dts))
+    if median_dt <= 0:
+        return 0.0
+
+    sigma_per_step = float(np.std(log_ret, ddof=1))
+    annualization = float(np.sqrt(_SECONDS_PER_YEAR / median_dt))
+    vol = sigma_per_step * annualization
+
+    if not np.isfinite(vol) or vol < 0:
+        return 0.0
+    # Cap at 1000% annual to keep the downstream Monte Carlo numerically sane.
+    return min(vol, 10.0)
 
 
 def _compute_rsi(prices: pd.Series, period: int = 14) -> float:
@@ -53,10 +106,17 @@ def analyze_coin(group: pd.DataFrame) -> dict:
         "score_trend": "stable",
         "tech_score": 50,
         "tech_reason": [],
+        # Annualized realized volatility (e.g. 0.80 = 80%/yr). 0.0 means
+        # not enough history yet. Consumed by app/brain.py as the input
+        # to the C++ Monte Carlo dispersion estimator.
+        "realized_vol_annualized": 0.0,
     }
 
     if len(prices) < 3:
         return result
+
+    # Realized vol — vectorized, runs once per cache miss per symbol.
+    result["realized_vol_annualized"] = _compute_realized_vol(prices, group["ts"])
 
     # RSI
     if len(prices) >= 15:

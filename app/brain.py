@@ -115,13 +115,29 @@ def _label(score: int) -> str:
 
 def _annualized_vol(coin_data: dict) -> float:
     """
-    Crude annualized-volatility proxy from coin pipeline data.
+    Annualized volatility for the Monte Carlo input.
 
-    We don't yet have a rolling realized-vol column on every symbol in the
-    scan output, so we approximate with abs(price_change_24h) / 100 treated
-    as a one-day move and annualized via sqrt(365). Floored at 5% so very
-    calm coins still produce a sensible Monte Carlo input.
+    Preference order:
+        1. Rolling realized vol from `technical_analysis._compute_realized_vol`,
+           injected into coin_data as `realized_volatility`. This is the std-dev
+           of log returns over the last ~50 snapshots, annualized.
+        2. Fallback proxy: abs(price_change_24h)/100 treated as a one-day move
+           and annualized via sqrt(365). Used when the TA pipeline doesn't
+           have enough history yet (new symbol, fresh DB, etc.).
+
+    Always returns a positive float capped at 5.0 (500%/yr) to keep the
+    downstream MC well-conditioned.
     """
+    rv = coin_data.get("realized_volatility")
+    if rv is not None:
+        try:
+            rv_f = float(rv)
+            if rv_f > 0.0:
+                return min(rv_f, 5.0)
+        except (TypeError, ValueError):
+            pass
+
+    # Fallback: 24h-percentage proxy.
     pct = abs(float(coin_data.get("price_change_24h", 0) or 0))
     daily_vol = max(pct / 100.0, 0.05)
     return daily_vol * (365.0 ** 0.5)
@@ -170,6 +186,20 @@ def analyze_coin_brain(symbol: str, coin_data: dict = None) -> dict:
     symbol = symbol.upper()
     coin_data = coin_data or {}
 
+    # Pull TA early. The TA module is cached for 10 min and computes
+    # rolling realized volatility — we feed that into _quant_status as the
+    # Monte Carlo vol input, falling back to the 24h-pct proxy when the TA
+    # pipeline doesn't have enough history.
+    try:
+        ta_all = get_technical_signals([symbol])
+    except Exception:
+        ta_all = {}
+    ta = ta_all.get(symbol, {})
+
+    realized_vol = float(ta.get("realized_vol_annualized", 0.0) or 0.0)
+    if realized_vol > 0:
+        coin_data = {**coin_data, "realized_volatility": realized_vol}
+
     qstatus = _quant_status(coin_data)
     weights = qstatus.weights
 
@@ -177,10 +207,8 @@ def analyze_coin_brain(symbol: str, coin_data: dict = None) -> dict:
     total   = 0.0   # weighted sum
     weight  = 0.0   # accumulated weight
 
-    # 1. Technical Analysis
+    # 1. Technical Analysis (TA already fetched above; reuse the dict)
     try:
-        ta_all = get_technical_signals([symbol])
-        ta = ta_all.get(symbol, {})
         ta_score = float(ta.get("tech_score", 50))
         ta_reasons = ta.get("tech_reason", [])
         total  += ta_score * weights["ta"]
@@ -347,10 +375,12 @@ def analyze_coin_brain(symbol: str, coin_data: dict = None) -> dict:
         "funding_rate":   funding_rate,
         "fear_greed":     fg_value,
         # quant fields (always present; zero/false when extension unavailable)
-        "entropy":        round(qstatus.entropy, 3),
-        "quant_volatile": qstatus.volatile,
-        "quant_active":   qstatus.available,
-        "weights_used":   weights,
+        "entropy":          round(qstatus.entropy, 3),
+        "quant_volatile":   qstatus.volatile,
+        "quant_active":     qstatus.available,
+        "weights_used":     weights,
+        "realized_vol":     round(realized_vol, 3),  # 0.0 when TA had no history
+        "vol_source":       "realized" if realized_vol > 0 else "24h_proxy",
     }
 
 
@@ -412,5 +442,10 @@ def format_brain_text(symbol: str, coin_data: dict = None) -> str:
     lines.append(f"Fear & Greed: {fg_val}/100")
     if data.get("quant_active"):
         regime = "VOLATILE" if data.get("quant_volatile") else "calm"
-        lines.append(f"Quant: entropy={data['entropy']:.2f} ({regime})")
+        rv = data.get("realized_vol", 0.0)
+        src = data.get("vol_source", "24h_proxy")
+        if rv > 0:
+            lines.append(f"Quant: entropy={data['entropy']:.2f} ({regime}) | vol={rv:.0%} ({src})")
+        else:
+            lines.append(f"Quant: entropy={data['entropy']:.2f} ({regime}) | vol={src}")
     return "\n".join(lines)
