@@ -40,13 +40,19 @@ namespace py = pybind11;
 namespace {
 
 // Std-dev of 1-hour log returns at which we say "fully volatile".
-// Calibrated so that:
-//   ~30% annualized vol  -> entropy ≈ 0.05  (very calm)
-//   ~80% annualized vol  -> entropy ≈ 0.45  (typical alt)
-//   ~150% annualized vol -> entropy ≈ 1.00  (saturated, memecoin)
+// Recalibrated for realized volatility input (post-a6092bd). The original
+// bounds (0.005, 0.050) were tuned when brain.py fed in a proxy-inflated
+// vol from abs(price_change_24h)*sqrt(365) with a 5% floor; with TRUE
+// realized vol now plumbed in, BTC at ~42% annualized was clamping to
+// entropy=0 because its 1h std (~0.0045) sat below the lower bound.
+// New bounds map the realized-vol distribution we actually observe:
+//   ~30% annualized vol  -> entropy ≈ 0.07  (calm BTC)
+//   ~80% annualized vol  -> entropy ≈ 0.36  (typical alt)
+//   ~120% annualized vol -> entropy ≈ 0.58  (volatile regime trips)
+//   ~190% annualized vol -> entropy ≈ 1.00  (saturated, memecoin)
 // Tunable; not load-bearing.
-constexpr double STD_LOW_BOUND  = 0.005;
-constexpr double STD_HIGH_BOUND = 0.050;
+constexpr double STD_LOW_BOUND  = 0.002;
+constexpr double STD_HIGH_BOUND = 0.020;
 
 constexpr int    HORIZON_STEPS  = 60;                  // 60 one-minute steps
 constexpr double HORIZON_YEARS  = 1.0 / (24.0 * 365.0); // 1 hour in years
