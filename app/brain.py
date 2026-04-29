@@ -62,22 +62,31 @@ _SENTIMENT_SCORE = {"bullish": 75, "neutral": 50, "bearish": 25}
 # Weight schedules — each schedule must sum to 1.0
 # ----------------------------------------------------------------------
 DEFAULT_WEIGHTS = {
-    "ta":     0.30,
+    # News is pinned at 0.0 because the CryptoPanic free tier was killed
+    # and the source is short-circuited in news_scanner. The freed 0.20
+    # split evenly between TA (the strongest single signal in calm regimes)
+    # and Whale (smart-money flow). Flip news back on if/when a replacement
+    # provider is wired up.
+    "ta":     0.40,
     "ai":     0.20,
-    "news":   0.20,
+    "news":   0.00,
     "social": 0.15,
-    "whale":  0.10,
+    "whale":  0.20,
     "memory": 0.05,
 }
 
 VOLATILE_WEIGHTS = {
-    # high-dispersion regime: short-horizon predictive signals (TA / ML)
-    # get punished; flow + fundamentals (whales / news) absorb the slack
+    # High-dispersion regime: short-horizon predictive signals (TA / ML)
+    # get punished; flow signals dominate. With news now dead, the freed
+    # 0.25 mostly goes to whale (the canonical "flow stays informative"
+    # anchor when models break) with a small bump to social for the
+    # narrative component. Net effect: whale weight doubles when entropy
+    # crosses the volatile threshold (20% calm → 40% volatile).
     "ta":     0.20,
     "ai":     0.15,
-    "news":   0.25,
-    "social": 0.15,
-    "whale":  0.20,
+    "news":   0.00,
+    "social": 0.20,
+    "whale":  0.40,
     "memory": 0.05,
 }
 
