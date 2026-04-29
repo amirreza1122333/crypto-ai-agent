@@ -10,18 +10,31 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 CRYPTOPANIC_URL = "https://cryptopanic.com/api/free/v1/posts/"
 CACHE_TTL = 900  # 15 minutes
 
+# TODO: CryptoPanic free tier is dead. Bypassed to save latency and prevent
+# 403 errors. Flip NEWS_ENABLED=True (and either pay for CryptoPanic Pro or
+# swap providers) to re-enable. Brain.py reads neutral sentiment / count=0
+# while this is False, contributing a midpoint score with no log noise.
+NEWS_ENABLED = False
+
 _cache: dict = {}
 _cache_ts: float = 0.0
 
 
 def _fetch_raw(symbol: str = None) -> list:
+    # TODO: CryptoPanic free tier is dead. Bypassed to save latency and prevent 403 errors.
+    if not NEWS_ENABLED:
+        return []
+
     params = {"public": "true", "kind": "news"}
     if symbol:
         params["currencies"] = symbol.upper()
     try:
-        r = requests.get(CRYPTOPANIC_URL, params=params, timeout=10, verify=SSL_VERIFY)
-        r.raise_for_status()
-        return r.json().get("results", [])
+        # Original call — left commented out for the day CryptoPanic comes back
+        # or someone wires up a replacement provider.
+        # r = requests.get(CRYPTOPANIC_URL, params=params, timeout=10, verify=SSL_VERIFY)
+        # r.raise_for_status()
+        # return r.json().get("results", [])
+        return []
     except Exception as e:
         print(f"[NEWS] Fetch failed: {e}")
         return []
@@ -83,6 +96,12 @@ def fetch_all_news() -> dict:
 
 
 def get_coin_news(symbol: str) -> dict:
+    # TODO: CryptoPanic free tier is dead. Bypassed to save latency and
+    # prevent 403 errors. Returns the canonical empty dict immediately
+    # (sentiment="neutral", count=0) so brain.py and api.py keep working.
+    if not NEWS_ENABLED:
+        return _empty()
+
     symbol = symbol.upper()
     all_news = fetch_all_news()
     if symbol in all_news:
@@ -103,6 +122,14 @@ def _empty() -> dict:
 
 
 def format_news_text(symbol: str) -> str:
+    # TODO: CryptoPanic free tier is dead. Bypassed to save latency and
+    # prevent 403 errors. Be honest with users: not "no news," but "no source."
+    if not NEWS_ENABLED:
+        return (
+            f"News scanning for {symbol.upper()} is currently disabled "
+            "(CryptoPanic free tier was discontinued — no replacement wired up yet)."
+        )
+
     data = get_coin_news(symbol)
     if not data["count"]:
         return f"No recent news found for {symbol.upper()}."
