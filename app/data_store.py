@@ -9,7 +9,7 @@ DB_PATH = Path(__file__).resolve().parent.parent / "data" / "market_history.db"
 def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5)
     c = conn.cursor()
 
     c.execute("""
@@ -39,7 +39,7 @@ def save_snapshot(df: pd.DataFrame):
     if df is None or df.empty:
         return
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5)
 
     ts = datetime.utcnow().isoformat()
 
@@ -72,14 +72,14 @@ def save_snapshot(df: pd.DataFrame):
 
 
 def load_all_data():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5)
     df = pd.read_sql("SELECT * FROM market_snapshots", conn)
     conn.close()
     return df
 
 
 def load_symbol_data(symbol: str):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5)
     df = pd.read_sql(
         "SELECT * FROM market_snapshots WHERE symbol=? ORDER BY ts ASC",
         conn,
@@ -90,7 +90,7 @@ def load_symbol_data(symbol: str):
 
 
 def load_latest_snapshots_per_symbol(limit_per_symbol: int = 3) -> pd.DataFrame:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5)
     query = f"""
     WITH ranked AS (
         SELECT

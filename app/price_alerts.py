@@ -9,7 +9,7 @@ DB_PATH = Path(__file__).resolve().parent.parent / "user_data.db"
 
 
 def init_price_alerts_table():
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     con.execute("""
     CREATE TABLE IF NOT EXISTS price_alerts (
         id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -27,7 +27,7 @@ def init_price_alerts_table():
 
 def add_price_alert(chat_id: int, symbol: str, target_price: float, direction: str) -> int:
     """Returns the new alert ID, or -1 on failure."""
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     try:
         cur = con.execute("""
             INSERT INTO price_alerts (chat_id, symbol, target_price, direction, created_ts)
@@ -42,7 +42,7 @@ def add_price_alert(chat_id: int, symbol: str, target_price: float, direction: s
 
 
 def get_user_price_alerts(chat_id: int) -> list:
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     cur = con.cursor()
     cur.execute("""
         SELECT id, symbol, target_price, direction, created_ts
@@ -59,7 +59,7 @@ def get_user_price_alerts(chat_id: int) -> list:
 
 
 def remove_price_alert(chat_id: int, alert_id: int) -> bool:
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     cur = con.cursor()
     cur.execute(
         "DELETE FROM price_alerts WHERE id=? AND chat_id=?",
@@ -72,7 +72,7 @@ def remove_price_alert(chat_id: int, alert_id: int) -> bool:
 
 
 def get_all_active_alerts() -> list:
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     cur = con.cursor()
     cur.execute("""
         SELECT id, chat_id, symbol, target_price, direction
@@ -88,7 +88,7 @@ def get_all_active_alerts() -> list:
 
 
 def mark_alert_triggered(alert_id: int):
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     con.execute("UPDATE price_alerts SET triggered=1 WHERE id=?", (alert_id,))
     con.commit()
     con.close()

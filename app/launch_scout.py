@@ -66,7 +66,7 @@ TWITTER_QUERY = (
 # ── DB ─────────────────────────────────────────────────────────────────────
 
 def init_scout_tables():
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     con.execute("""
     CREATE TABLE IF NOT EXISTS scout_announcements (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -94,7 +94,7 @@ def init_scout_tables():
 def _save(source, author, text, url, mint, eta_min) -> bool:
     """Save announcement; returns True if it's new (not a duplicate)."""
     try:
-        con = sqlite3.connect(DB_PATH)
+        con = sqlite3.connect(DB_PATH, timeout=5)
         cur = con.cursor()
         cur.execute(
             "INSERT OR IGNORE INTO scout_announcements "
@@ -112,7 +112,7 @@ def _save(source, author, text, url, mint, eta_min) -> bool:
 
 def get_pending_alerts() -> list:
     """Announcements detected but not yet sent to Telegram."""
-    con  = sqlite3.connect(DB_PATH)
+    con  = sqlite3.connect(DB_PATH, timeout=5)
     cur  = con.cursor()
     cutoff = int(time.time()) - 3600 * 6
     cur.execute("""
@@ -131,14 +131,14 @@ def get_pending_alerts() -> list:
 
 
 def mark_alerted(ann_id: int):
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     con.execute("UPDATE scout_announcements SET alerted=1 WHERE id=?", (ann_id,))
     con.commit()
     con.close()
 
 
 def get_recent_announcements(limit=10) -> list:
-    con  = sqlite3.connect(DB_PATH)
+    con  = sqlite3.connect(DB_PATH, timeout=5)
     cur  = con.cursor()
     cutoff = int(time.time()) - 3600 * 6
     cur.execute("""

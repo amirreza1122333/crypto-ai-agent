@@ -40,7 +40,7 @@ GRADUATION_MCAP_USD   = 65_000   # must match prelaunch_tracker.GRADUATION_MCAP
 
 
 def init_creator_reputation_table() -> None:
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     con.execute("""
         CREATE TABLE IF NOT EXISTS creator_reputation (
             creator            TEXT PRIMARY KEY,
@@ -86,7 +86,7 @@ def recompute_creator(creator: str) -> dict:
     if not creator:
         return {}
 
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     cur = con.cursor()
 
     # Pull every launch by this wallet along with its 6h outcome row if any.
@@ -164,7 +164,7 @@ def get_creator_stats(creator: str) -> dict:
     """Fast lookup for live scoring. Returns empty dict for unknown wallets."""
     if not creator:
         return {}
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     cur = con.cursor()
     cur.execute("""
         SELECT total_launches, graduations,
@@ -199,7 +199,7 @@ def recompute_all_creators() -> int:
 
     Cheap: typically <10K distinct creators even after months of scanning.
     """
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     cur = con.cursor()
     cur.execute(
         "SELECT DISTINCT creator FROM prelaunch_tokens WHERE creator IS NOT NULL AND creator != ''"
@@ -219,7 +219,7 @@ def recompute_all_creators() -> int:
 
 def top_creators(limit: int = 10, min_launches: int = 2) -> list:
     """Leaderboard for /stats command."""
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     cur = con.cursor()
     cur.execute("""
         SELECT creator, total_launches, graduations,

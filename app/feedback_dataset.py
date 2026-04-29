@@ -6,7 +6,7 @@ DB_PATH = Path(__file__).resolve().parent.parent / "user_data.db"
 
 
 def load_closed_alerts():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5)
 
     df = pd.read_sql("""
         SELECT *

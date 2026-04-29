@@ -69,7 +69,7 @@ BRAIN_ALERT_THRESHOLD   = 72    # brain score threshold for brain alerts
 DAILY_REPORT_HOUR_UTC   = 8     # send daily report at 8am UTC
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5)
     c = conn.cursor()
 
     c.execute("""
@@ -156,7 +156,7 @@ def add_to_watchlist(chat_id: int, symbol: str) -> bool:
     if not symbol:
         return False
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5)
     c = conn.cursor()
 
     try:
@@ -198,7 +198,7 @@ def paper_positions_text(chat_id: int) -> str:
 def remove_from_watchlist(chat_id: int, symbol: str) -> bool:
     symbol = symbol.upper().strip()
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5)
     c = conn.cursor()
     c.execute(
         "DELETE FROM watchlist WHERE chat_id=? AND symbol=?",
@@ -224,7 +224,7 @@ def paper_stats_text(chat_id: int) -> str:
 
 
 def get_watchlist(chat_id: int) -> list[str]:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5)
     c = conn.cursor()
     c.execute(
         "SELECT symbol FROM watchlist WHERE chat_id=? ORDER BY symbol ASC",
@@ -236,7 +236,7 @@ def get_watchlist(chat_id: int) -> list[str]:
 
 
 def get_all_watchlist_users() -> list[int]:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5)
     c = conn.cursor()
     c.execute("SELECT DISTINCT chat_id FROM watchlist")
     rows = c.fetchall()
@@ -262,7 +262,7 @@ def should_send_alert_advanced(chat_id: int, coin: dict) -> bool:
     prob = float(coin.get("pump_probability_6h", 0) or 0)
     signal = str(coin.get("ai_signal", ""))
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5)
     c = conn.cursor()
 
     c.execute("""
@@ -309,7 +309,7 @@ def mark_alert_sent_advanced(chat_id: int, coin: dict):
 
     now_ts = int(time.time())
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5)
     c = conn.cursor()
 
     c.execute("""
@@ -653,7 +653,7 @@ def format_gems(gems: list) -> str:
 
 
 def _is_gem_alerted(token_key: str) -> bool:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5)
     c = conn.cursor()
     c.execute("SELECT alerted_ts FROM gem_alerted WHERE token_key=?", (token_key,))
     row = c.fetchone()
@@ -664,7 +664,7 @@ def _is_gem_alerted(token_key: str) -> bool:
 
 
 def _mark_gem_alerted(token_key: str):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5)
     c = conn.cursor()
     c.execute(
         "INSERT OR REPLACE INTO gem_alerted (token_key, alerted_ts) VALUES (?, ?)",
@@ -769,7 +769,7 @@ def save_alert_entry(chat_id: int, coin: dict):
     symbol = coin.get("symbol")
     price = float(coin.get("current_price", 0) or 0)
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5)
     c = conn.cursor()
 
     c.execute("""

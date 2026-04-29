@@ -47,7 +47,7 @@ import sqlite3
 # ── User store ─────────────────────────────────────────────────────────────
 
 def _subscribe(chat_id: int):
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     con.execute(
         "INSERT OR REPLACE INTO scout_users (chat_id, subscribed) VALUES (?, 1)",
         (chat_id,)
@@ -57,7 +57,7 @@ def _subscribe(chat_id: int):
 
 
 def _unsubscribe(chat_id: int):
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     con.execute(
         "UPDATE scout_users SET subscribed=0 WHERE chat_id=?", (chat_id,)
     )
@@ -66,7 +66,7 @@ def _unsubscribe(chat_id: int):
 
 
 def _get_subscribers() -> list:
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     cur = con.cursor()
     cur.execute("SELECT chat_id FROM scout_users WHERE subscribed=1")
     rows = cur.fetchall()

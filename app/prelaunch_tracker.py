@@ -106,7 +106,7 @@ OUTCOME_LOOKBACK_HOURS = 48      # only consider tokens detected in last 48h
 # ──────────────────────────────────────────────────────────────────────────
 
 def init_prelaunch_tables():
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     con.execute("""
     CREATE TABLE IF NOT EXISTS prelaunch_tokens (
         mint            TEXT PRIMARY KEY,
@@ -302,7 +302,7 @@ def score_new_token(ws_msg: dict, sol_price: float = 150.0) -> tuple:
 def _add(mint, name, symbol, creator, mcap_usd, sol_price,
          score=0, tier="COLD", has_twitter=0, has_telegram=0, has_website=0):
     now = int(time.time())
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     con.execute("""
         INSERT OR IGNORE INTO prelaunch_tokens
         (mint, name, symbol, creator, detected_ts, last_mcap_usd, peak_mcap_usd,
@@ -319,7 +319,7 @@ def _add(mint, name, symbol, creator, mcap_usd, sol_price,
 
 def _update(mint, mcap):
     now = int(time.time())
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     con.execute("""
         UPDATE prelaunch_tokens
         SET last_mcap_usd=?, last_checked_ts=?,
@@ -335,14 +335,14 @@ def _update(mint, mcap):
 
 
 def _mark(mint, col):
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     con.execute(f"UPDATE prelaunch_tokens SET {col}=1 WHERE mint=?", (mint,))
     con.commit()
     con.close()
 
 
 def _flags(mint) -> dict:
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     cur = con.cursor()
     cur.execute("""
         SELECT m_5k, m_30k, m_50k, m_grad,
@@ -364,7 +364,7 @@ def _flags(mint) -> dict:
 
 def get_active_tokens() -> list:
     cutoff = int(time.time()) - TRACK_HOURS * 3600
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     cur = con.cursor()
     cur.execute("""
         SELECT mint, name, symbol, creator, detected_ts,
@@ -385,7 +385,7 @@ def get_active_tokens() -> list:
 def get_all_recent(limit=20) -> list:
     """All tokens detected in last 6 hours, including graduated."""
     cutoff = int(time.time()) - TRACK_HOURS * 3600
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     cur = con.cursor()
     cur.execute("""
         SELECT mint, name, symbol, detected_ts, last_mcap_usd, peak_mcap_usd, graduated
@@ -467,7 +467,7 @@ def _fetch_mcap(mint: str) -> float:
 
 def _eta_minutes(mint: str, current_mcap: float) -> int:
     """Estimate minutes until graduation using MCap velocity."""
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     cur = con.cursor()
     cutoff = int(time.time()) - 3600
     cur.execute(
@@ -503,7 +503,7 @@ def _velocity_trend(mint: str) -> tuple:
     Returns (-1, -1) when there is not enough data.
     """
     now = int(time.time())
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     cur = con.cursor()
     cur.execute(
         "SELECT mcap, ts FROM prelaunch_history WHERE mint=? AND ts > ? ORDER BY ts ASC",
@@ -578,7 +578,7 @@ def _check_token(t: dict):
     if mcap >= GRADUATION_MCAP and not f.get("m_grad"):
         _mark(mint, "m_grad")
         _mark(mint, "graduated")
-        con = sqlite3.connect(DB_PATH)
+        con = sqlite3.connect(DB_PATH, timeout=5)
         con.execute("UPDATE prelaunch_tokens SET graduated=1 WHERE mint=?", (mint,))
         con.commit()
         con.close()
@@ -617,7 +617,7 @@ def _check_token(t: dict):
         _mark(mint, "m_5k")
         if age_min <= 60:
             # Fetch score from DB for richer alert
-            con  = sqlite3.connect(DB_PATH)
+            con  = sqlite3.connect(DB_PATH, timeout=5)
             cur  = con.cursor()
             cur.execute(
                 "SELECT launch_score, launch_tier, has_twitter, has_telegram FROM prelaunch_tokens WHERE mint=?",
@@ -669,7 +669,7 @@ def _check_token(t: dict):
             mins_to_zone = int((PRE_ZONE_MAX_MCAP - mcap) / v_short) if v_short > 0 else -1
             eta_zone = f"~{mins_to_zone}min to graduation zone" if mins_to_zone > 0 else ""
 
-            con = sqlite3.connect(DB_PATH)
+            con = sqlite3.connect(DB_PATH, timeout=5)
             cur = con.cursor()
             cur.execute(
                 "SELECT launch_score, launch_tier, has_twitter, has_telegram FROM prelaunch_tokens WHERE mint=?",
@@ -719,7 +719,7 @@ def _check_token(t: dict):
         else:
             vel_line = ""
 
-        con = sqlite3.connect(DB_PATH)
+        con = sqlite3.connect(DB_PATH, timeout=5)
         cur = con.cursor()
         cur.execute(
             "SELECT launch_score, launch_tier, has_twitter, has_telegram, creator FROM prelaunch_tokens WHERE mint=?",
@@ -878,7 +878,7 @@ def _get_detected_initial_mcap(mint: str) -> float:
     the earliest prelaunch_history row if the column is missing or zero
     (older rows inserted before this column existed).
     """
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     cur = con.cursor()
     cur.execute(
         "SELECT COALESCE(initial_mcap_usd, 0) FROM prelaunch_tokens WHERE mint=?",
@@ -912,7 +912,7 @@ def _outcomes_due() -> list:
     now = int(time.time())
     cutoff = now - OUTCOME_LOOKBACK_HOURS * 3600
 
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     cur = con.cursor()
     cur.execute("""
         SELECT mint, detected_ts, last_mcap_usd, peak_mcap_usd, graduated
@@ -953,7 +953,7 @@ def _record_outcome(mint: str, horizon_min: int,
     if initial and initial > 0:
         return_pct = ((peak_mcap or 0.0) - initial) / initial * 100.0
 
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     con.execute("""
         INSERT OR IGNORE INTO prelaunch_outcomes
         (mint, horizon_min, snapshot_ts,
@@ -984,7 +984,7 @@ def _refresh_mcap_for_old_token(d: dict) -> tuple:
     if fresh > 0:
         current = fresh
         peak = max(peak, fresh)
-        con = sqlite3.connect(DB_PATH)
+        con = sqlite3.connect(DB_PATH, timeout=5)
         con.execute("""
             UPDATE prelaunch_tokens
                SET last_mcap_usd = ?,
@@ -1019,7 +1019,7 @@ def record_outcomes_once() -> int:
             )
             recorded += 1
             # Track which creator's stats need refreshing.
-            con = sqlite3.connect(DB_PATH)
+            con = sqlite3.connect(DB_PATH, timeout=5)
             cur = con.cursor()
             cur.execute("SELECT creator FROM prelaunch_tokens WHERE mint=?", (d["mint"],))
             row = cur.fetchone()
@@ -1133,7 +1133,7 @@ def format_stats() -> str:
     actually predictive of outcomes? Breaks down graduation rate and
     median/max 6h return by launch_tier and shows the top creators.
     """
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     cur = con.cursor()
 
     cur.execute("SELECT COUNT(*) FROM prelaunch_tokens")
@@ -1510,7 +1510,7 @@ async def _ingest_trade_token(mint: str, mcap_usd: float, sol_price: float) -> N
 
 
 def _is_known(mint: str) -> bool:
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     cur = con.cursor()
     cur.execute("SELECT 1 FROM prelaunch_tokens WHERE mint=?", (mint,))
     found = cur.fetchone() is not None
@@ -1577,7 +1577,7 @@ async def _trade_feed_listen():
 def _has_recent_trade(mint: str, window_secs: int = ACTIVE_TRADE_WINDOW) -> tuple:
     """Returns (is_active, velocity_usd_per_min) based on recent history."""
     cutoff = int(time.time()) - window_secs
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     cur = con.cursor()
     cur.execute(
         "SELECT mcap, ts FROM prelaunch_history WHERE mint=? AND ts > ? ORDER BY ts ASC",
@@ -1602,7 +1602,7 @@ def _fetch_graduation_zone() -> list:
     """
     now    = int(time.time())
     cutoff = now - TRACK_HOURS * 3600
-    con    = sqlite3.connect(DB_PATH)
+    con    = sqlite3.connect(DB_PATH, timeout=5)
     cur    = con.cursor()
     cur.execute("""
         SELECT mint, name, symbol, last_mcap_usd, has_twitter, has_telegram,
@@ -1638,7 +1638,7 @@ def _fetch_pre_zone() -> list:
     """
     now    = int(time.time())
     cutoff = now - TRACK_HOURS * 3600
-    con    = sqlite3.connect(DB_PATH)
+    con    = sqlite3.connect(DB_PATH, timeout=5)
     cur    = con.cursor()
     cur.execute("""
         SELECT mint, name, symbol, last_mcap_usd, has_twitter, has_telegram,
@@ -1766,7 +1766,7 @@ def get_hot_preorders(max_age_minutes: int = 120, min_velocity: float = 40) -> l
             continue
 
         # Need at least 2 history points to measure velocity
-        con = sqlite3.connect(DB_PATH)
+        con = sqlite3.connect(DB_PATH, timeout=5)
         cur = con.cursor()
         cur.execute(
             "SELECT mcap, ts FROM prelaunch_history WHERE mint=? ORDER BY ts ASC",
@@ -1902,7 +1902,7 @@ def get_approaching_tokens(max_eta_hours: float = 6) -> list:
             continue           # too far out
 
         # Calculate velocity from history for display
-        con = sqlite3.connect(DB_PATH)
+        con = sqlite3.connect(DB_PATH, timeout=5)
         cur = con.cursor()
         cutoff = int(time.time()) - 3600
         cur.execute(

@@ -53,7 +53,7 @@ DEFAULT_PURGE_HOURS  = 6
 
 def _load_joined(horizon_min: int) -> pd.DataFrame:
     """Join tokens + outcomes + creator_rep + sniper into one dataframe."""
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     # LEFT JOINs on creator_reputation and sniper_checks so tokens without
     # enrichment still appear (features get filled with defaults below).
     df = pd.read_sql("""

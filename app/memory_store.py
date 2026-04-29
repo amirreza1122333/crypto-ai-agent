@@ -14,7 +14,7 @@ CONSISTENCY_THRESHOLD = 3
 
 
 def _conn():
-    return sqlite3.connect(DB_PATH)
+    return sqlite3.connect(DB_PATH, timeout=5)
 
 
 def init_memory_table():

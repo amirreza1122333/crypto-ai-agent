@@ -13,7 +13,7 @@ EVALUATION_DELAY = 3600  # 1 ساعت
 
 
 def get_open_alerts():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5)
     c = conn.cursor()
 
     c.execute("""
@@ -58,7 +58,7 @@ def evaluate_alerts():
         return_pct = (current_price - entry_price) / entry_price
         is_win = 1 if return_pct > 0 else 0
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=5)
         c = conn.cursor()
 
         c.execute("""

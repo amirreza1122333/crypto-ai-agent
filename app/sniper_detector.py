@@ -36,7 +36,7 @@ _cache: dict = {}
 
 def init_sniper_table() -> None:
     """Persist sniper checks so stats and ML features can query historically."""
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     con.execute("""
         CREATE TABLE IF NOT EXISTS sniper_checks (
             mint           TEXT PRIMARY KEY,
@@ -54,7 +54,7 @@ def init_sniper_table() -> None:
 
 
 def _persist(mint: str, result: dict) -> None:
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     con.execute("""
         INSERT INTO sniper_checks
         (mint, checked_ts, top1_pct, top5_pct, top10_pct,
@@ -144,7 +144,7 @@ def check_sniper_concentration(mint: str) -> dict:
 
 def get_last_check(mint: str) -> dict:
     """Retrieve the most recent persisted check, if any."""
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     cur = con.cursor()
     cur.execute("""
         SELECT checked_ts, top1_pct, top5_pct, top10_pct, sniped, label, total_supply

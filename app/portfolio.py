@@ -9,7 +9,7 @@ DB_PATH = Path(__file__).resolve().parent.parent / "user_data.db"
 
 
 def init_portfolio_table():
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     con.execute("""
     CREATE TABLE IF NOT EXISTS portfolio (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -28,7 +28,7 @@ def init_portfolio_table():
 def add_holding(chat_id: int, symbol: str, quantity: float, avg_price: float) -> str:
     """Add or update a holding. Returns 'added' or 'updated'."""
     symbol = symbol.upper()
-    con    = sqlite3.connect(DB_PATH)
+    con    = sqlite3.connect(DB_PATH, timeout=5)
     cur    = con.cursor()
 
     cur.execute("SELECT quantity, avg_price FROM portfolio WHERE chat_id=? AND symbol=?",
@@ -58,7 +58,7 @@ def add_holding(chat_id: int, symbol: str, quantity: float, avg_price: float) ->
 
 def remove_holding(chat_id: int, symbol: str) -> bool:
     symbol = symbol.upper()
-    con    = sqlite3.connect(DB_PATH)
+    con    = sqlite3.connect(DB_PATH, timeout=5)
     cur    = con.cursor()
     cur.execute("DELETE FROM portfolio WHERE chat_id=? AND symbol=?", (chat_id, symbol))
     deleted = cur.rowcount > 0
@@ -68,7 +68,7 @@ def remove_holding(chat_id: int, symbol: str) -> bool:
 
 
 def get_holdings(chat_id: int) -> list:
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=5)
     cur = con.cursor()
     cur.execute(
         "SELECT symbol, quantity, avg_price FROM portfolio WHERE chat_id=? ORDER BY symbol",

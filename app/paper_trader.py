@@ -7,7 +7,7 @@ DB_PATH = Path(__file__).resolve().parent.parent / "user_data.db"
 
 
 def _connect():
-    return sqlite3.connect(DB_PATH)
+    return sqlite3.connect(DB_PATH, timeout=5)
 
 
 def ensure_paper_account(chat_id: int):
