@@ -53,6 +53,14 @@ These exist because each one was a real bug we already fixed once.
    `app.config`) on every `requests.*` call — never `verify=False`.
    Users opt into insecure mode via `INSECURE_SSL=true` in `.env`.
 
+9. **`quant_core` is an OPTIONAL native (C++ / pybind11) extension.**
+   Source lives at `quant_core.cpp` + `setup_quant.py` (project root).
+   Build with `python setup_quant.py build_ext --inplace`. The compiled
+   `.pyd`/`.so` is gitignored — every machine builds its own. `app/brain.py`
+   imports it inside a `try/except ImportError` and degrades gracefully to
+   the original static weights when missing. Do not make it a hard
+   dependency — the bot must boot without it.
+
 ---
 
 ## Conventions

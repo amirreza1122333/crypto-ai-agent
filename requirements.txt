@@ -13,3 +13,6 @@ joblib>=1.4.0
 websockets>=12.0
 xgboost>=2.0.0
 groq>=0.9.0
+# Build-time only; needed to compile quant_core via setup_quant.py.
+# Safe to leave installed at runtime.
+pybind11>=2.11

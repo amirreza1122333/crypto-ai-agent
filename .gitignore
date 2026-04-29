@@ -4,3 +4,9 @@ __pycache__/
 *.pyc
 *.log
 user_data.db
+
+# quant_core native extension build artifacts (machine-specific)
+*.pyd
+*.so
+build/
+*.egg-info/

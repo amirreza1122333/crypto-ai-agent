@@ -1,16 +1,30 @@
 """
-Brain module - orchestrates all intelligence signals into a single
+Brain module — orchestrates all intelligence signals into a single
 brain_score, brain_signal, and brain_reason for each coin.
 
-Signal sources and weights:
-  - Technical Analysis (RSI, MA, pattern, volume): 30%
-  - AI prediction (pump_probability_6h):           20%
-  - News sentiment (CryptoPanic):                  20%
-  - Social sentiment (Reddit):                     15%
-  - Whale / volume activity:                       10%
-  - Memory / consistency tracking:                  5%
+Default signal weights (calm regime):
+    Technical Analysis (RSI, MA, pattern, volume): 30%
+    AI prediction (pump_probability_6h):           20%
+    News sentiment (CryptoPanic):                  20%
+    Social sentiment (Reddit):                     15%
+    Whale / volume activity:                       10%
+    Memory / consistency tracking:                  5%
+
+Dynamic weighting (when quant_core is available and entropy > 0.50):
+    Reduce TA/ML weight; reallocate to whales + news. Rationale: during
+    high-dispersion regimes short-horizon predictive models lose edge,
+    while flow/fundamental signals stay informative.
+
+Confidence haircut (entropy > 0.70):
+    brain_score multiplied by 0.9 to mark the output as low-confidence.
+
+The C++ extension `quant_core` is OPTIONAL. If it isn't built, brain.py
+falls back to the original static weights with no behavior change.
+Build it from the project root with:
+    python setup_quant.py build_ext --inplace
 """
 import time
+from dataclasses import dataclass, field
 
 from app.technical_analysis import get_technical_signals
 from app.news_scanner       import get_coin_news
@@ -20,6 +34,23 @@ from app.memory_store       import get_memory_score, init_memory_table, update_c
 from app.funding_rates      import get_funding_data
 from app.fear_greed         import get_fear_greed
 
+# ----------------------------------------------------------------------
+# Optional native MC extension. Built via setup_quant.py at project root.
+# If not compiled, brain.py degrades to the original static weights with
+# no behavior change.
+# ----------------------------------------------------------------------
+try:
+    import quant_core  # type: ignore
+    QUANT_AVAILABLE = True
+except ImportError:
+    quant_core = None  # type: ignore
+    QUANT_AVAILABLE = False
+    print(
+        "[BRAIN] quant_core native extension not found — using static weights. "
+        "Run `python setup_quant.py build_ext --inplace` from the project root to enable dynamic weighting."
+    )
+
+
 CACHE_TTL = 300  # 5 minutes
 _brain_cache:    dict  = {}
 _brain_cache_ts: float = 0.0
@@ -27,7 +58,53 @@ _brain_cache_ts: float = 0.0
 # Sentiment → score mapping
 _SENTIMENT_SCORE = {"bullish": 75, "neutral": 50, "bearish": 25}
 
-# Signal thresholds for brain_signal label
+# ----------------------------------------------------------------------
+# Weight schedules — each schedule must sum to 1.0
+# ----------------------------------------------------------------------
+DEFAULT_WEIGHTS = {
+    "ta":     0.30,
+    "ai":     0.20,
+    "news":   0.20,
+    "social": 0.15,
+    "whale":  0.10,
+    "memory": 0.05,
+}
+
+VOLATILE_WEIGHTS = {
+    # high-dispersion regime: short-horizon predictive signals (TA / ML)
+    # get punished; flow + fundamentals (whales / news) absorb the slack
+    "ta":     0.20,
+    "ai":     0.15,
+    "news":   0.25,
+    "social": 0.15,
+    "whale":  0.20,
+    "memory": 0.05,
+}
+
+assert abs(sum(DEFAULT_WEIGHTS.values()) - 1.0) < 1e-9
+assert abs(sum(VOLATILE_WEIGHTS.values()) - 1.0) < 1e-9
+
+# Entropy thresholds (output of quant_core.calculate_entropy is in [0, 1])
+ENTROPY_VOLATILE_THRESHOLD     = 0.50  # weight shift kicks in above this
+ENTROPY_HIGH_UNCERTAINTY_LIMIT = 0.70  # confidence haircut above this
+
+# Number of MC paths per call. The native side runs ~100k paths in <50ms.
+N_PATHS = 100_000
+
+
+@dataclass
+class QuantStatus:
+    """Aggregator status reported alongside brain_score."""
+    entropy: float = 0.0
+    volatile: bool = False
+    high_uncertainty: bool = False
+    weights: dict = field(default_factory=lambda: dict(DEFAULT_WEIGHTS))
+    available: bool = QUANT_AVAILABLE
+
+
+# ----------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------
 def _label(score: int) -> str:
     if score >= 75: return "Strong Buy"
     if score >= 62: return "Buy"
@@ -36,144 +113,179 @@ def _label(score: int) -> str:
     return "Caution"
 
 
+def _annualized_vol(coin_data: dict) -> float:
+    """
+    Crude annualized-volatility proxy from coin pipeline data.
+
+    We don't yet have a rolling realized-vol column on every symbol in the
+    scan output, so we approximate with abs(price_change_24h) / 100 treated
+    as a one-day move and annualized via sqrt(365). Floored at 5% so very
+    calm coins still produce a sensible Monte Carlo input.
+    """
+    pct = abs(float(coin_data.get("price_change_24h", 0) or 0))
+    daily_vol = max(pct / 100.0, 0.05)
+    return daily_vol * (365.0 ** 0.5)
+
+
+def _quant_status(coin_data: dict) -> QuantStatus:
+    """
+    Compute entropy via quant_core (if compiled) and choose a weight schedule.
+    Falls back to DEFAULT_WEIGHTS on any failure — never raises into the
+    aggregator hot path.
+    """
+    if not QUANT_AVAILABLE:
+        return QuantStatus()
+
+    try:
+        price = float(coin_data.get("current_price", 0) or 0)
+        if price <= 0:
+            return QuantStatus()
+        vol = _annualized_vol(coin_data)
+        entropy = float(quant_core.calculate_entropy(price, vol, N_PATHS))
+    except Exception as e:
+        print(f"[BRAIN] quant_core call failed: {e!r} — falling back to static weights")
+        return QuantStatus()
+
+    is_volatile = entropy > ENTROPY_VOLATILE_THRESHOLD
+    is_high_unc = entropy > ENTROPY_HIGH_UNCERTAINTY_LIMIT
+    weights = dict(VOLATILE_WEIGHTS if is_volatile else DEFAULT_WEIGHTS)
+    return QuantStatus(
+        entropy=entropy,
+        volatile=is_volatile,
+        high_uncertainty=is_high_unc,
+        weights=weights,
+        available=True,
+    )
+
+
+# ----------------------------------------------------------------------
+# Main analysis
+# ----------------------------------------------------------------------
 def analyze_coin_brain(symbol: str, coin_data: dict = None) -> dict:
     """
     Full brain analysis for a single symbol.
-    coin_data is optional dict from the scan pipeline
-    (provides pump_probability_6h, signal_type, final_score, etc.)
+    coin_data is an optional dict from the scan pipeline that provides
+    pump_probability_6h, signal_type, final_score, current_price, etc.
     """
     symbol = symbol.upper()
     coin_data = coin_data or {}
 
+    qstatus = _quant_status(coin_data)
+    weights = qstatus.weights
+
     reasons = []
     total   = 0.0   # weighted sum
-    weight  = 0.0   # total weight accumulated
+    weight  = 0.0   # accumulated weight
 
-    # ------------------------------------------------------------------
-    # 1. Technical Analysis  (weight 0.30)
-    # ------------------------------------------------------------------
+    # 1. Technical Analysis
     try:
         ta_all = get_technical_signals([symbol])
         ta = ta_all.get(symbol, {})
         ta_score = float(ta.get("tech_score", 50))
         ta_reasons = ta.get("tech_reason", [])
-        total  += ta_score * 0.30
-        weight += 0.30
+        total  += ta_score * weights["ta"]
+        weight += weights["ta"]
         for r in ta_reasons[:2]:
             reasons.append(f"TA: {r}")
     except Exception:
         ta_score = 50
-        total  += 50 * 0.30
-        weight += 0.30
+        total  += 50 * weights["ta"]
+        weight += weights["ta"]
 
-    # ------------------------------------------------------------------
-    # 2. AI Prediction  (weight 0.20)
-    # ------------------------------------------------------------------
+    # 2. AI Prediction
     prob = float(coin_data.get("pump_probability_6h", 0) or 0)
-    ai_signal = str(coin_data.get("ai_signal", ""))
     if prob > 0:
         ai_score = prob * 100
-        total    += ai_score * 0.20
-        weight   += 0.20
+        total    += ai_score * weights["ai"]
+        weight   += weights["ai"]
         if prob >= 0.70:
             reasons.append(f"AI: {prob:.0%} pump probability (strong)")
         elif prob >= 0.55:
             reasons.append(f"AI: {prob:.0%} pump probability")
     else:
-        total  += 50 * 0.20
-        weight += 0.20
+        total  += 50 * weights["ai"]
+        weight += weights["ai"]
 
-    # ------------------------------------------------------------------
-    # 3. News sentiment  (weight 0.20)
-    # ------------------------------------------------------------------
+    # 3. News sentiment
+    news = {}
     try:
         news = get_coin_news(symbol)
         news_sent  = news.get("sentiment", "neutral")
         news_score = _SENTIMENT_SCORE.get(news_sent, 50)
         news_count = news.get("count", 0)
-        total  += news_score * 0.20
-        weight += 0.20
+        total  += news_score * weights["news"]
+        weight += weights["news"]
         if news_count > 0:
             reasons.append(f"News: {news_count} articles, {news_sent} sentiment")
     except Exception:
-        total  += 50 * 0.20
-        weight += 0.20
+        total  += 50 * weights["news"]
+        weight += weights["news"]
 
-    # ------------------------------------------------------------------
-    # 4. Social / Reddit  (weight 0.15)
-    # ------------------------------------------------------------------
+    # 4. Social / Reddit
+    social = {}
     try:
         social      = get_social_data(symbol)
         social_sent = social.get("sentiment", "neutral")
         soc_score   = _SENTIMENT_SCORE.get(social_sent, 50)
         mentions    = social.get("mentions", 0)
-        total  += soc_score * 0.15
-        weight += 0.15
+        total  += soc_score * weights["social"]
+        weight += weights["social"]
         if mentions > 0:
             reasons.append(f"Reddit: {mentions} mentions, {social_sent}")
     except Exception:
-        total  += 50 * 0.15
-        weight += 0.15
+        total  += 50 * weights["social"]
+        weight += weights["social"]
 
-    # ------------------------------------------------------------------
-    # 5. Whale / volume activity  (weight 0.10)
-    # ------------------------------------------------------------------
+    # 5. Whale / volume activity
+    whale = {}
     try:
         whale      = get_whale_signal(symbol)
         wh_score   = float(whale.get("whale_score", 50))
         wh_signal  = whale.get("whale_signal", "normal")
         wh_reasons = whale.get("whale_reason", [])
-        total  += wh_score * 0.10
-        weight += 0.10
+        total  += wh_score * weights["whale"]
+        weight += weights["whale"]
         if wh_signal not in ("normal",):
             reasons.append(f"Whale: {wh_signal.replace('_', ' ').title()}")
         elif wh_reasons:
             reasons.append(f"Volume: {wh_reasons[0]}")
     except Exception:
-        total  += 50 * 0.10
-        weight += 0.10
+        total  += 50 * weights["whale"]
+        weight += weights["whale"]
 
-    # ------------------------------------------------------------------
-    # 6. Memory / consistency  (weight 0.05)
-    # ------------------------------------------------------------------
+    # 6. Memory / consistency
     try:
         mem      = get_memory_score(symbol)
         mem_sc   = float(mem.get("memory_score", 50))
         mem_reas = mem.get("memory_reason", [])
-        total  += mem_sc * 0.05
-        weight += 0.05
+        total  += mem_sc * weights["memory"]
+        weight += weights["memory"]
         for r in mem_reas[:1]:
             reasons.append(f"Memory: {r}")
     except Exception:
-        total  += 50 * 0.05
-        weight += 0.05
+        total  += 50 * weights["memory"]
+        weight += weights["memory"]
 
-    # ------------------------------------------------------------------
-    # 7. Funding rates (bonus/penalty on top, no weight - modifier only)
-    # ------------------------------------------------------------------
+    # 7. Funding rates (modifier on top, no weight)
     funding_signal = "no_data"
     funding_rate   = 0.0
+    brain_score_adj = 0
     try:
         funding = get_funding_data(symbol)
         if funding.get("available"):
             funding_signal = funding.get("signal", "neutral")
             funding_rate   = funding.get("funding_rate", 0.0)
-            adj            = funding.get("score_adj", 0)
-            if adj != 0:
-                brain_score_adj = adj   # applied after weight calc
-                for r in funding.get("reason", [])[:1]:
-                    reasons.append(f"Funding: {r}")
+            brain_score_adj = funding.get("score_adj", 0)
+            for r in funding.get("reason", [])[:1]:
+                reasons.append(f"Funding: {r}")
     except Exception:
-        brain_score_adj = 0
+        pass
 
-    # ------------------------------------------------------------------
-    # 8. Fear & Greed market context (modifier only, no weight)
-    # ------------------------------------------------------------------
+    # 8. Fear & Greed market context (modifier, no weight)
     fg_value = 50
     try:
         fg       = get_fear_greed()
         fg_value = fg.get("value", 50)
-        # Extreme fear boosts score (buy opportunity), extreme greed penalizes
         if fg_value <= 20:
             reasons.append(f"Market in Extreme Fear ({fg_value}) - historically good entry")
         elif fg_value >= 80:
@@ -185,26 +297,32 @@ def analyze_coin_brain(symbol: str, coin_data: dict = None) -> dict:
     # Final score
     # ------------------------------------------------------------------
     brain_score = int(round(total / weight)) if weight > 0 else 50
-
-    # Apply funding rate modifier
-    try:
-        brain_score += brain_score_adj
-    except NameError:
-        pass
-
-    # Fear & Greed modifier
+    brain_score += brain_score_adj
     if fg_value <= 20:
         brain_score += 5
     elif fg_value >= 80:
         brain_score -= 5
 
-    # Penalty: if base scan score is very low
     base_score = float(coin_data.get("final_score", 0) or 0)
     if base_score > 0 and base_score < 0.40:
         brain_score = max(0, brain_score - 10)
         reasons.append(f"Low base score ({base_score:.2f}) - penalty applied")
 
-    # Update memory with this cycle's data
+    # Quant-driven annotations + confidence haircut
+    if qstatus.high_uncertainty:
+        before = brain_score
+        brain_score = int(round(brain_score * 0.9))
+        reasons.append(
+            f"High simulated dispersion (entropy={qstatus.entropy:.2f}) - "
+            f"confidence reduced ({before} → {brain_score})"
+        )
+    elif qstatus.volatile:
+        reasons.append(
+            f"Volatile regime (entropy={qstatus.entropy:.2f}) - "
+            f"weights shifted toward whales/news"
+        )
+
+    # Update memory store with this cycle's data
     try:
         update_coin_memory(
             symbol,
@@ -216,30 +334,34 @@ def analyze_coin_brain(symbol: str, coin_data: dict = None) -> dict:
         pass
 
     return {
-        "symbol":        symbol,
-        "brain_score":   brain_score,
-        "brain_signal":  _label(brain_score),
-        "brain_reason":  reasons[:5],   # top 5 reasons
-        "ta_score":      int(ta_score),
-        "ai_prob":       round(prob, 3),
-        "news_sent":     news.get("sentiment", "neutral") if "news" in dir() else "neutral",
-        "social_sent":   social.get("sentiment", "neutral") if "social" in dir() else "neutral",
-        "whale_signal":   whale.get("whale_signal", "normal") if "whale" in dir() else "normal",
+        "symbol":         symbol,
+        "brain_score":    brain_score,
+        "brain_signal":   _label(brain_score),
+        "brain_reason":   reasons[:5],
+        "ta_score":       int(ta_score),
+        "ai_prob":        round(prob, 3),
+        "news_sent":      news.get("sentiment", "neutral"),
+        "social_sent":    social.get("sentiment", "neutral"),
+        "whale_signal":   whale.get("whale_signal", "normal"),
         "funding_signal": funding_signal,
         "funding_rate":   funding_rate,
         "fear_greed":     fg_value,
+        # quant fields (always present; zero/false when extension unavailable)
+        "entropy":        round(qstatus.entropy, 3),
+        "quant_volatile": qstatus.volatile,
+        "quant_active":   qstatus.available,
+        "weights_used":   weights,
     }
 
 
 def get_brain_report(coin_list: list) -> dict:
     """
     coin_list: list of dicts from the scan pipeline, each with 'symbol' key.
-    Returns dict keyed by symbol with brain analysis.
+    Returns a dict keyed by symbol with brain analysis.
     """
     global _brain_cache, _brain_cache_ts
     now = time.time()
 
-    # Rebuild if cache expired
     if now - _brain_cache_ts > CACHE_TTL:
         _brain_cache = {}
         _brain_cache_ts = now
@@ -288,4 +410,7 @@ def format_brain_text(symbol: str, coin_data: dict = None) -> str:
     if data.get("funding_signal", "no_data") != "no_data":
         lines.append(f"Funding: {funding_rate:+.4f}%/8h ({funding_label})")
     lines.append(f"Fear & Greed: {fg_val}/100")
+    if data.get("quant_active"):
+        regime = "VOLATILE" if data.get("quant_volatile") else "calm"
+        lines.append(f"Quant: entropy={data['entropy']:.2f} ({regime})")
     return "\n".join(lines)
