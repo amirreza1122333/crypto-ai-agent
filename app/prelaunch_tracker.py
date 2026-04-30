@@ -53,6 +53,7 @@ from app.sniper_detector import (
     check_sniper_concentration,
     format_sniper_line,
 )
+from app.helius_enricher import get_creator_supply_pct
 from app.live_scorer import adjust_tier as ml_adjust_tier, model_is_available
 
 DB_PATH          = Path(__file__).resolve().parent.parent / "user_data.db"
@@ -181,6 +182,11 @@ def init_prelaunch_tables():
         ("m_imminent",       "INTEGER DEFAULT 0"),
         # Fired once when token in $8K-$30K shows velocity >= PRE_ZONE_ALERT_VEL.
         ("m_rising",         "INTEGER DEFAULT 0"),
+        # Creator's % of total supply — measured once at the $5K milestone
+        # via Helius and persisted. NULL = not yet measured. >20% is rug
+        # risk, <2% is suspiciously low commitment. See
+        # apply_creator_pct_adjustment() for the scoring impact.
+        ("creator_pct",      "REAL"),
     ]
     for col, typedef in new_cols:
         try:
@@ -225,7 +231,102 @@ def _name_score(name: str) -> int:
     return 10
 
 
-def score_new_token(ws_msg: dict, sol_price: float = 150.0) -> tuple:
+def apply_creator_pct_adjustment(score: int, creator_pct):
+    """
+    Adjust a launch score based on the creator wallet's % of total supply.
+
+    Pure function — no I/O, easy to test. Pass `creator_pct=None` to skip
+    the adjustment entirely (used when the value hasn't been measured yet).
+
+    Returns (adjusted_score, reason_or_None) where adjusted_score stays in
+    [0, 100] and reason is a short string for the alert payload.
+
+    Heuristics (tunable, keep in one place):
+        creator_pct >= 35  → -25  extreme rug risk
+        creator_pct >= 20  → -15  high concentration
+        2 <= cp <= 15      → +5   skin in the game (fair launch)
+        creator_pct < 2    → -10  suspiciously low commitment
+        15 < cp < 20       →  0   middle ground, no signal
+    """
+    if creator_pct is None:
+        return score, None
+    try:
+        pct = float(creator_pct)
+    except (TypeError, ValueError):
+        return score, None
+    if pct < 0:
+        # Sentinel from get_creator_supply_pct meaning "fetch failed"
+        return score, None
+
+    if pct >= 35.0:
+        return max(0, score - 25), f"Creator holds {pct:.1f}% — extreme rug risk"
+    if pct >= 20.0:
+        return max(0, score - 15), f"Creator holds {pct:.1f}% — high concentration"
+    if 2.0 <= pct <= 15.0:
+        return min(100, score + 5), f"Creator skin in game: {pct:.1f}%"
+    if pct < 2.0:
+        return max(0, score - 10), f"Creator holds {pct:.1f}% — low commitment"
+    # 15 < pct < 20: middle ground
+    return score, None
+
+
+def _fetch_and_persist_creator_pct(mint: str, creator: str):
+    """
+    Lazy lookup of creator supply % for a single token. Idempotent:
+    once we've persisted a value (including failure marker NULL → -1.0),
+    subsequent calls hit the DB instead of Helius.
+
+    Returns the percentage (float in [0, 100]), or None if Helius could
+    not be reached / no creator on file. Persists the measured value to
+    `prelaunch_tokens.creator_pct` so future scoring rounds don't refetch.
+
+    Cost: ~2 Helius credits on first call per mint, 0 thereafter.
+    Should be called from milestone code paths (e.g. m_5k) where a few
+    extra credits are justified by the alert's value.
+    """
+    if not creator:
+        return None
+
+    con = sqlite3.connect(DB_PATH, timeout=5)
+    cur = con.cursor()
+    cur.execute("SELECT creator_pct FROM prelaunch_tokens WHERE mint=?", (mint,))
+    row = cur.fetchone()
+    con.close()
+    if row and row[0] is not None:
+        try:
+            cached = float(row[0])
+        except (TypeError, ValueError):
+            cached = None
+        if cached is not None and cached >= 0:
+            return cached
+        # Cached failure sentinel — don't refetch this run
+        if cached is not None and cached < 0:
+            return None
+
+    try:
+        pct = get_creator_supply_pct(mint, creator)
+    except Exception as e:
+        print(f"[PRELAUNCH] creator_pct fetch failed for {mint[:8]}: {e}")
+        pct = -1.0
+
+    # Persist regardless: success caches the value; failure caches the
+    # sentinel so we don't hammer Helius on every monitor pass.
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=5)
+        con.execute(
+            "UPDATE prelaunch_tokens SET creator_pct=? WHERE mint=?",
+            (pct, mint),
+        )
+        con.commit()
+        con.close()
+    except Exception as e:
+        print(f"[PRELAUNCH] creator_pct persist failed for {mint[:8]}: {e}")
+
+    return pct if pct >= 0 else None
+
+
+def score_new_token(ws_msg: dict, sol_price: float = 150.0,
+                    creator_pct=None) -> tuple:
     """
     Score a newly created pump.fun token from WebSocket event data.
 
@@ -236,6 +337,9 @@ def score_new_token(ws_msg: dict, sol_price: float = 150.0) -> tuple:
       Quality name      → +20  (not random letters)
       Has description   → +10
       Strong initial buy→ +10
+
+    Optional creator_pct adjustment (when measured via Helius):
+      see apply_creator_pct_adjustment()
 
     Tiers:
       HOT  (≥55) → alert immediately
@@ -280,6 +384,12 @@ def score_new_token(ws_msg: dict, sol_price: float = 150.0) -> tuple:
         reasons.append(f"Buy-in: {_fmt(mcap_usd)}")
     elif mcap_usd >= 4_000:
         score += 5
+
+    # Creator concentration adjustment (only when caller provided a
+    # measured value — defaults to None which is a no-op).
+    score, creator_reason = apply_creator_pct_adjustment(score, creator_pct)
+    if creator_reason:
+        reasons.append(creator_reason)
 
     # Tier
     #   HOT  (≥50): Twitter OR Telegram + something = likely organized launch
@@ -616,20 +726,22 @@ def _check_token(t: dict):
     elif mcap >= 5_000 and not f.get("m_5k"):
         _mark(mint, "m_5k")
         if age_min <= 60:
-            # Fetch score from DB for richer alert
+            # Fetch score + creator wallet from DB for richer alert
             con  = sqlite3.connect(DB_PATH, timeout=5)
             cur  = con.cursor()
             cur.execute(
-                "SELECT launch_score, launch_tier, has_twitter, has_telegram FROM prelaunch_tokens WHERE mint=?",
+                "SELECT launch_score, launch_tier, has_twitter, has_telegram, creator "
+                "FROM prelaunch_tokens WHERE mint=?",
                 (mint,)
             )
             row = cur.fetchone()
             con.close()
-            sc   = row[0] if row else 0
-            tier = row[1] if row else "?"
-            twit = "𝕏" if (row and row[2]) else ""
-            tele = "✈️" if (row and row[3]) else ""
-            soc  = " ".join(filter(None, [twit, tele])) or "—"
+            sc      = row[0] if row else 0
+            tier    = row[1] if row else "?"
+            twit    = "𝕏" if (row and row[2]) else ""
+            tele    = "✈️" if (row and row[3]) else ""
+            soc     = " ".join(filter(None, [twit, tele])) or "—"
+            creator = row[4] if row else ""
 
             # Sniper check — only worth the Helius credits now that the
             # token has proven it can get off the floor. If the top 5
@@ -644,12 +756,24 @@ def _check_token(t: dict):
                 return
             sniper_line = format_sniper_line(sniper)
 
+            # Creator initial buy % — measured once per token, persisted.
+            # Adjusts the score and produces a one-line warning when the
+            # creator holds extreme amounts (>20% rug risk) or virtually
+            # nothing (<2%, no skin in the game).
+            creator_pct = _fetch_and_persist_creator_pct(mint, creator)
+            adjusted_sc, creator_reason = apply_creator_pct_adjustment(sc, creator_pct)
+            score_str = f"Score: {adjusted_sc}/100 [{tier}]"
+            if adjusted_sc != sc:
+                score_str += f" (was {sc})"
+            creator_line = f"Creator: {creator_reason}" if creator_reason else ""
+
             _alert(
                 f"PRE-LAUNCH: Gaining Traction!\n\n"
                 f"{name} ({symbol.upper()})\n"
                 f"MCap: {_fmt(mcap)} | Age: {age_min}m\n"
-                f"Score: {sc}/100 [{tier}] | Socials: {soc}\n"
+                f"{score_str} | Socials: {soc}\n"
                 + (sniper_line + "\n" if sniper_line else "")
+                + (creator_line + "\n" if creator_line else "")
                 + f"https://pump.fun/{mint}"
             )
 

@@ -123,6 +123,74 @@ def _get_creator_txs(creator: str, limit: int = 25) -> list:
     return data if isinstance(data, list) else []
 
 
+def _get_owner_token_balance(owner: str, mint: str) -> float:
+    """
+    ~1 credit — total amount of `mint` held by `owner`.
+
+    Sums all of the owner's token accounts that hold this mint (a wallet can
+    technically have multiple ATAs for the same mint, though it's rare).
+    Returns the raw on-chain amount (not adjusted for decimals); pair with
+    _get_token_supply for a ratio.
+
+    Returns 0.0 on any failure or when Helius isn't configured.
+    """
+    if not owner or not mint:
+        return 0.0
+    result = _rpc(
+        "getTokenAccountsByOwner",
+        [owner, {"mint": mint}, {"encoding": "jsonParsed"}],
+    )
+    if not isinstance(result, dict):
+        return 0.0
+    accounts = result.get("value") or []
+    total = 0.0
+    for acc in accounts:
+        try:
+            amount = (
+                acc.get("account", {})
+                   .get("data", {})
+                   .get("parsed", {})
+                   .get("info", {})
+                   .get("tokenAmount", {})
+                   .get("amount", "0")
+            )
+            total += float(amount)
+        except (TypeError, ValueError, AttributeError):
+            continue
+    return total
+
+
+def get_creator_supply_pct(mint: str, creator: str) -> float:
+    """
+    Percentage of `mint`'s total supply held by the `creator` wallet.
+
+    Returns:
+        A float in [0.0, 100.0] on success.
+        -1.0 if Helius isn't configured or any RPC call fails.
+        (The negative sentinel lets callers distinguish "creator really
+        holds 0% of the supply" from "we couldn't measure".)
+
+    Cost: ~2 Helius credits (getTokenAccountsByOwner + getTokenSupply).
+    Cheap enough to call at every $5K milestone, but DON'T call it on
+    every newly-created token — pump.fun spawns 1000+ per hour.
+    """
+    if not HELIUS_API_KEY or not mint or not creator:
+        return -1.0
+
+    try:
+        balance = _get_owner_token_balance(creator, mint)
+        supply  = _get_token_supply(mint)
+        if supply <= 0:
+            return -1.0
+        pct = balance / supply * 100.0
+        if pct < 0:
+            return -1.0
+        return round(min(pct, 100.0), 2)
+    except Exception as e:
+        print(f"[HELIUS] creator_supply_pct {creator[:8]}/{mint[:8]}: {e}")
+        return -1.0
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Analysis
 # ──────────────────────────────────────────────────────────────────────────
