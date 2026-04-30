@@ -17,6 +17,7 @@ Helius only used for enrichment after milestone alerts.
 """
 import asyncio
 import json
+import math
 import re
 import sqlite3
 import time
@@ -27,6 +28,21 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from app.config import SSL_VERIFY
+
+# Optional native MC extension. Used by the entropy gate at the higher
+# milestones (m_30k, m_50k, m_imminent) to suppress alerts on chaotic
+# chop. Mirrors the import pattern in brain.py — if not built, the gate
+# silently bypasses (no crash, alerts fire normally).
+try:
+    import quant_core  # type: ignore
+    _QUANT_AVAILABLE = True
+except ImportError:
+    quant_core = None  # type: ignore
+    _QUANT_AVAILABLE = False
+    print(
+        "[PRELAUNCH] quant_core native extension not found — entropy gate disabled. "
+        "Build with `python setup_quant.py build_ext --inplace` from project root."
+    )
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -643,6 +659,185 @@ def _velocity_trend(mint: str) -> tuple:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Entropy gate — feeds pump.fun tick data into the C++ Monte Carlo engine
+# (quant_core) to suppress alerts on chaotic chop while still letting
+# strong-momentum tokens through.
+# ──────────────────────────────────────────────────────────────────────────
+
+# Minimum log-returns to compute a meaningful std-dev. Below this, vol
+# is too noisy to trust and the gate defaults to "bypass".
+ENTROPY_MIN_VOL_SAMPLES   = 5
+
+# Default lookback window for realized vol.
+ENTROPY_VOL_WINDOW_MIN    = 10
+
+# Suppress alerts when entropy crosses this AND score is below the
+# strong-floor. 0.70 matches brain.py's HIGH_UNCERTAINTY threshold.
+ENTROPY_HIGH_THRESHOLD    = 0.70
+
+# Tokens with score >= this bypass the gate entirely. Rationale:
+# overwhelmingly strong signals (Twitter + Telegram + good name + skin
+# in game) earn the right to alert even through chop.
+ENTROPY_STRONG_SCORE_FLOOR = 70
+
+# Pre-launch MC paths. Half of brain.py's 100k since this can fire
+# multiple times per token across milestones, and 50k still produces
+# stable entropy at sub-50ms native cost.
+ENTROPY_QUANT_PATHS       = 50_000
+
+# IMPORTANT calibration note:
+#
+# pump.fun tokens have such extreme intraday volatility that a textbook
+# annualized vol (sigma_per_step × sqrt(seconds_per_year / dt)) lands
+# in the thousands of percent — well past quant_core's saturation
+# threshold (~190% annualized → entropy 1.0). That would force entropy
+# to 1.0 for every pump.fun token, making the gate useless.
+#
+# Instead, we pass a SCALED per-window std-dev as the `vol` argument to
+# quant_core. The scale below is calibrated empirically so:
+#
+#     sigma_window 0.02  (smooth directional)  → vol 0.4 → entropy ~0.13 (calm)
+#     sigma_window 0.05  (mildly choppy)       → vol 1.0 → entropy ~0.48 (just below)
+#     sigma_window 0.10  (chaotic chop)        → vol 2.0 → entropy ~0.95 (fires)
+#
+# This is NOT the same semantic quantity as the realized vol fed to
+# quant_core from brain.py. The two pipelines deliberately use different
+# vol conventions because the underlying volatility regimes are
+# different by orders of magnitude. Don't unify them without recalibrating.
+PUMPFUN_VOL_SCALE         = 20.0
+
+
+def compute_pumpfun_realized_vol(mint: str,
+                                 window_minutes: int = ENTROPY_VOL_WINDOW_MIN) -> float:
+    """
+    Compute a quant_core-friendly volatility input from the prelaunch_history
+    mcap series for a single token.
+
+    Reads the last `window_minutes` of mcap/ts rows, computes the std-dev
+    of log returns between consecutive snapshots, and scales it by
+    PUMPFUN_VOL_SCALE so the result lands in quant_core's sensitive input
+    range (see the calibration note on PUMPFUN_VOL_SCALE).
+
+    The output is NOT a textbook annualized volatility — it's a transform
+    tuned so calm/directional pump.fun tokens get low entropy and chaotic
+    chop gets high entropy. Pure stdlib; no pandas/numpy on the hot path.
+
+    Returns 0.0 when:
+      - the DB query fails for any reason
+      - there are < ENTROPY_MIN_VOL_SAMPLES log returns in the window
+      - any individual snapshot has mcap <= 0
+    Callers should treat 0.0 as "skip the entropy gate".
+    """
+    now    = int(time.time())
+    cutoff = now - max(window_minutes, 1) * 60
+
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=5)
+        cur = con.cursor()
+        cur.execute(
+            "SELECT mcap, ts FROM prelaunch_history WHERE mint=? AND ts > ? ORDER BY ts ASC",
+            (mint, cutoff),
+        )
+        rows = cur.fetchall()
+        con.close()
+    except Exception as e:
+        print(f"[ENTROPY] history query failed for {mint[:8]}: {e}")
+        return 0.0
+
+    if len(rows) < ENTROPY_MIN_VOL_SAMPLES + 1:
+        return 0.0
+
+    log_returns = []
+    for i in range(1, len(rows)):
+        m_prev = rows[i - 1][0]
+        m_curr = rows[i][0]
+        if m_prev is None or m_curr is None or m_prev <= 0 or m_curr <= 0:
+            continue
+        try:
+            log_returns.append(math.log(m_curr / m_prev))
+        except (ValueError, ZeroDivisionError):
+            continue
+
+    if len(log_returns) < ENTROPY_MIN_VOL_SAMPLES:
+        return 0.0
+
+    n    = len(log_returns)
+    mean = sum(log_returns) / n
+    var  = sum((r - mean) ** 2 for r in log_returns) / (n - 1)
+    sigma_per_step = math.sqrt(var)
+
+    return sigma_per_step * PUMPFUN_VOL_SCALE
+
+
+def _entropy_gate(mint: str, current_mcap: float, score: int) -> tuple:
+    """
+    Decide whether to suppress an alert based on chaotic-chop entropy.
+
+    Returns (should_suppress, entropy, reason).
+        should_suppress  bool   — True = caller should skip the alert
+        entropy          float in [0, 1] when computed; None when gate bypassed
+        reason           short string describing why we passed/blocked
+
+    Suppression logic — ALL conditions must hold for suppression:
+        1. quant_core extension is loaded
+        2. score < ENTROPY_STRONG_SCORE_FLOOR (strong tokens are exempt)
+        3. compute_pumpfun_realized_vol returned a positive vol
+        4. quant_core entropy > ENTROPY_HIGH_THRESHOLD
+
+    Failure modes (all return should_suppress=False, entropy=None):
+        - quant_core not compiled
+        - too few mcap samples
+        - any exception during compute or quant_core call
+    """
+    if not _QUANT_AVAILABLE:
+        return False, None, "quant_core unavailable"
+
+    if score >= ENTROPY_STRONG_SCORE_FLOOR:
+        return False, None, f"score {score} >= floor {ENTROPY_STRONG_SCORE_FLOOR}"
+
+    try:
+        vol = compute_pumpfun_realized_vol(mint, ENTROPY_VOL_WINDOW_MIN)
+    except Exception as e:
+        print(f"[ENTROPY] vol compute failed for {mint[:8]}: {e}")
+        return False, None, "vol error"
+
+    if vol <= 0:
+        return False, None, "insufficient vol data"
+
+    try:
+        entropy = float(quant_core.calculate_entropy(
+            current_mcap, vol, ENTROPY_QUANT_PATHS,
+        ))
+    except Exception as e:
+        print(f"[ENTROPY] quant_core call failed for {mint[:8]}: {e}")
+        return False, None, "quant error"
+
+    if entropy > ENTROPY_HIGH_THRESHOLD:
+        return True, entropy, (
+            f"chaotic regime (entropy={entropy:.2f}) + weak score ({score})"
+        )
+    return False, entropy, f"entropy={entropy:.2f} below threshold"
+
+
+def _get_score_and_tier(mint: str) -> tuple:
+    """Tiny helper for milestone alerts that need score+tier from DB."""
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=5)
+        cur = con.cursor()
+        cur.execute(
+            "SELECT launch_score, launch_tier FROM prelaunch_tokens WHERE mint=?",
+            (mint,),
+        )
+        row = cur.fetchone()
+        con.close()
+        if not row:
+            return 0, "?"
+        return int(row[0] or 0), str(row[1] or "?")
+    except Exception:
+        return 0, "?"
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Alert system
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -703,23 +898,39 @@ def _check_token(t: dict):
     elif mcap >= 50_000 and not f.get("m_50k"):
         _mark(mint, "m_50k")
         if age_min <= 180:
+            sc, _tier = _get_score_and_tier(mint)
+            suppress, entropy, reason = _entropy_gate(mint, mcap, sc)
+            if suppress:
+                print(
+                    f"[PRELAUNCH] Suppressing $50K alert for {symbol} — {reason}"
+                )
+                return
+            ent_line = f"\nEntropy: {entropy:.2f}" if entropy is not None else ""
             _alert(
                 f"APPROACHING DEX LAUNCH!\n\n"
                 f"{name} ({symbol.upper()})\n"
                 f"MCap: {_fmt(mcap)} | Age: {age_min}m\n"
                 f"{eta_str}\n"
-                f"Close to $69K graduation!\n"
+                f"Close to $69K graduation!{ent_line}\n"
                 f"https://pump.fun/{mint}"
             )
 
     elif mcap >= 30_000 and not f.get("m_30k"):
         _mark(mint, "m_30k")
         if age_min <= 120:
+            sc, _tier = _get_score_and_tier(mint)
+            suppress, entropy, reason = _entropy_gate(mint, mcap, sc)
+            if suppress:
+                print(
+                    f"[PRELAUNCH] Suppressing $30K alert for {symbol} — {reason}"
+                )
+                return
+            ent_line = f"\nEntropy: {entropy:.2f}" if entropy is not None else ""
             _alert(
                 f"PRE-LAUNCH: Strong Momentum\n\n"
                 f"{name} ({symbol.upper()})\n"
                 f"MCap: {_fmt(mcap)} | Age: {age_min}m\n"
-                f"{eta_str}\n"
+                f"{eta_str}{ent_line}\n"
                 f"https://pump.fun/{mint}"
             )
 
@@ -878,6 +1089,18 @@ def _check_token(t: dict):
         sniper      = check_sniper_concentration(mint)
         sniper_line = format_sniper_line(sniper)
 
+        # Entropy gate — most consequential alert in the file. Suppress
+        # when the token is chopping chaotically AND the score isn't
+        # overwhelmingly strong; let strong-score tokens through even
+        # through chop (see ENTROPY_STRONG_SCORE_FLOOR).
+        suppress, entropy, reason = _entropy_gate(mint, mcap, sc)
+        if suppress:
+            print(
+                f"[PRELAUNCH] Suppressing IMMINENT alert for {symbol} — {reason}"
+            )
+            return
+        ent_line = f"\nEntropy: {entropy:.2f}" if entropy is not None else ""
+
         eta_label = f"~{eta}min to Raydium" if eta > 0 else f"{pct:.0f}% to graduation"
         _alert(
             f"IMMINENT DEX LAUNCH — {eta_label}!\n\n"
@@ -888,6 +1111,7 @@ def _check_token(t: dict):
             f"Score: {sc}/100 [{tier}] | Socials: {soc}"
             + creator_line
             + ("\n" + sniper_line if sniper_line else "")
+            + ent_line
             + f"\n\nBuy NOW before DEX listing:\nhttps://pump.fun/{mint}"
         )
 
