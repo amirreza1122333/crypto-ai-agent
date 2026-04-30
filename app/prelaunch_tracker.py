@@ -743,16 +743,21 @@ def _check_token(t: dict):
             soc     = " ".join(filter(None, [twit, tele])) or "—"
             creator = row[4] if row else ""
 
-            # Sniper check — only worth the Helius credits now that the
-            # token has proven it can get off the floor. If the top 5
-            # wallets already own most of the supply, suppress the alert
-            # entirely (tokens dominated by snipers rarely moon).
-            sniper = check_sniper_concentration(mint)
+            # Sniper + cluster check — only worth the Helius credits now
+            # that the token has proven it can get off the floor. Either
+            # signal (top-holder concentration OR coordinated multi-wallet
+            # cluster in the first 90s) sets sniped=True and suppresses
+            # the alert. detected_ts anchors the cluster window.
+            sniper = check_sniper_concentration(
+                mint, detected_ts=int(t.get("detected_ts", 0) or 0)
+            )
             if sniper.get("sniped"):
-                print(
-                    f"[PRELAUNCH] Suppressing $5K alert for {symbol} — "
-                    f"sniped (top5={sniper['top5_pct']}%)"
+                reason = (
+                    f"cluster (max {sniper.get('max_buyers_in_slot', 0)} wallets/block)"
+                    if sniper.get("cluster_detected")
+                    else f"sniped (top5={sniper.get('top5_pct', 0)}%)"
                 )
+                print(f"[PRELAUNCH] Suppressing $5K alert for {symbol} — {reason}")
                 return
             sniper_line = format_sniper_line(sniper)
 

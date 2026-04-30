@@ -123,6 +123,23 @@ def _get_creator_txs(creator: str, limit: int = 25) -> list:
     return data if isinstance(data, list) else []
 
 
+def get_token_transactions(mint: str, limit: int = 100) -> list:
+    """
+    ~limit credits — parsed Helius Enhanced Transactions involving this mint.
+
+    Returns most-recent-first. Each entry has `slot`, `timestamp`,
+    `tokenTransfers`, etc. Used by sniper_detector.check_block_clusters
+    to look for coordinated buys in the same slot.
+
+    Public API parallel of _get_creator_txs (same backend call, different
+    semantic intent).
+    """
+    if not mint:
+        return []
+    data = _api_get(f"addresses/{mint}/transactions", {"limit": limit})
+    return data if isinstance(data, list) else []
+
+
 def _get_owner_token_balance(owner: str, mint: str) -> float:
     """
     ~1 credit — total amount of `mint` held by `owner`.
